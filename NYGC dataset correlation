@@ -3,10 +3,6 @@ title: "RNAseq analysis for NYGC dataset-SC only-update Spearman-RIN+Sex"
 author: "Jianing"
 date: "2026-03-11"
 output: html_document
-For dataset:
-  GSE272626: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE272626
-  Paper1: https://www.nature.com/articles/s41593-022-01205-3
-  Paper2: https://academic.oup.com/brain/article/146/9/3770/7072405
 ---
 
 #----1.1 Preparation of packages----    
@@ -40,9 +36,7 @@ library(tibble)
 ```
 #----1.2 Preparation of the dataset----
 ```{r,message=FALSE}
-#20260311Note: 
-#From Adi, the "Jan24_Complete_counts_matrix.tsv" was the file for the APOE project after cleaning up, but it excluded a lot of other samples (SOD1)
-exp_data <- read.table(file = "Counts_file_DGE_March2023.tsv", header=T, check.names = FALSE)    #This was picked because it covers more gene and should be the original dataset
+exp_data <- read.table(file = "Counts_file_DGE_March2023.tsv", header=T, check.names = FALSE)    
 pdata <- read.csv("Target ALS RNA Metadata 05272022.csv", header=T)    #This is the file with correct information, with PMI
 pdata$ExternalSampleId %in% colnames(exp_data) #match sample data with expression data
 matched_pdata <- pdata[pdata$ExternalSampleId %in% colnames(exp_data) , ]
