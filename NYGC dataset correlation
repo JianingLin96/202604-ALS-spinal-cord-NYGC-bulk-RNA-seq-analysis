@@ -1,0 +1,1268 @@
+---
+title: "RNAseq analysis for NYGC dataset-SC only-update Spearman-RIN+Sex"
+author: "Jianing"
+date: "2026-03-11"
+output: html_document
+For dataset:
+  GSE272626: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE272626
+  Paper1: https://www.nature.com/articles/s41593-022-01205-3
+  Paper2: https://academic.oup.com/brain/article/146/9/3770/7072405
+---
+
+#----1.1 Preparation of packages----    
+```{r,message=FALSE}
+library(sva)
+library(GEOquery)
+library(FactoMineR)
+library(factoextra)  
+library(tidyverse) 
+library(pheatmap)
+library(edgeR)
+library(RColorBrewer)
+library(readxl)
+library(limma) 
+library(affy)
+library(stringr)
+library(DESeq2)
+library(readr) 
+library(ggplot2)
+library(dplyr)
+library(lookup)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(data.table)
+library(enrichplot)
+library(ggstatsplot)
+library(ggpubr) 
+library(tidyr)
+library(tibble)
+```
+#----1.2 Preparation of the dataset----
+```{r,message=FALSE}
+#20260311Note: 
+#From Adi, the "Jan24_Complete_counts_matrix.tsv" was the file for the APOE project after cleaning up, but it excluded a lot of other samples (SOD1)
+exp_data <- read.table(file = "Counts_file_DGE_March2023.tsv", header=T, check.names = FALSE)    #This was picked because it covers more gene and should be the original dataset
+pdata <- read.csv("Target ALS RNA Metadata 05272022.csv", header=T)    #This is the file with correct information, with PMI
+pdata$ExternalSampleId %in% colnames(exp_data) #match sample data with expression data
+matched_pdata <- pdata[pdata$ExternalSampleId %in% colnames(exp_data) , ]
+#removed_samples <- pdata[!pdata$ExternalSampleId %in% colnames(exp_data), ]  #Only if yo uwanna check the removed samples
+duplicated(matched_pdata$ExternalSampleId) #found one replicate
+matched_pdata <- matched_pdata [!duplicated(matched_pdata$ExternalSampleId),]
+write.csv(matched_pdata, "20260311NYGC_all_pdata.csv", row.names = FALSE)
+
+#Filtering
+matched_pdata$RIN <- as.numeric(as.character(matched_pdata$RIN))
+matched_pdata$Post.Mortem.Interval.in.Hours <- as.numeric(as.character(matched_pdata$Post.Mortem.Interval.in.Hours))
+matched_pdata <- subset(matched_pdata, RIN >= 5)  #Filter 1
+matched_pdata <- subset(matched_pdata, Post.Mortem.Interval.in.Hours <= 12)  #Filter 2
+matched_pdata <- matched_pdata[matched_pdata$Subject.Group.Subcategory == "Classical/Typical ALS", ]  #Filter 3
+target_groups <- c("Spinal_Cord_Cervical", "Spinal_Cord_Thoracic", "Spinal_Cord_Lumbar")
+matched_pdata <- matched_pdata[matched_pdata$Sample.Source %in% target_groups, ]  #Filter 4
+matched_pdata <- matched_pdata[!grepl("Positive for C9orf72 Repeat Expansion", matched_pdata$Reported.Genomic.Mutations..from.sites...NOT.in.any.way.associated.with.WGS.data.from.NYGC.), ]
+matched_pdata <- matched_pdata[!grepl("Positive for SOD1", matched_pdata$Reported.Genomic.Mutations..from.sites...NOT.in.any.way.associated.with.WGS.data.from.NYGC.), ]
+matched_pdata <- matched_pdata[!grepl("Yes", matched_pdata$C9orf72.Repeat.Expansion..Data.from.CUMC.), ]  #Filter 5
+
+sample_anno <- matched_pdata [,c("ExternalSampleId", "ExternalSubjectId", "NeuroBankID",  "Sex", "Site.of.Motor.Onset","Age.at.Symptom.Onset","Age.at.Death", "Sample.Source","RIN","Disease.Duration.in.Months", "Post.Mortem.Interval.in.Hours")]
+sample_anno$Sex <- factor(sample_anno$Sex) # e.g., levels might be c("Male", "Female") or c("M","F")
+sample_anno$Site.of.Motor.Onset <- factor(sample_anno$Site.of.Motor.Onset)
+sample_anno$Sample.Source <- factor(sample_anno$Sample.Source)
+sample_anno[, c(6:7, 9:11)] <- lapply(sample_anno[, c(6:7, 9:11)], as.numeric)
+sample_anno <- sample_anno %>%
+  rename(
+    PMI = Post.Mortem.Interval.in.Hours,
+    OnsetSite = Site.of.Motor.Onset
+  )
+write.csv(sample_anno, "20260311NYGC_filtered.csv", row.names = FALSE)
+
+# ---------- Analyzing patient metadata ----------
+library(tableone)
+vars <- c("Sex",
+          "OnsetSite",
+          "Age.at.Symptom.Onset",
+          "Age.at.Death",
+          "RIN",
+          "Disease.Duration.in.Months",
+          "PMI")
+
+factorVars <- c("Sex", "OnsetSite")
+table1 <- CreateTableOne(
+  vars = vars,
+  strata = "Sample.Source",
+  data = sample_anno,
+  factorVars = factorVars
+)
+
+table1_mat <- print(
+  table1,
+  nonnormal = c("PMI", "Disease.Duration.in.Months"),
+  showAllLevels = TRUE,
+  quote = FALSE,
+  noSpaces = TRUE,
+  printToggle = FALSE
+)
+
+ write.csv(table1_mat, "Table1_clinical_summary.csv")
+
+save(exp_data, pdata, matched_pdata, sample_anno, table1_mat,file = "20260311_NYGC_beforeDEG_RINfiltered.RData")
+```
+
+#----1.3 Listing the regions and gene pairs----
+```{r,message=FALSE}
+load("20260311_NYGC_beforeDEG_RINfiltered.RData")
+
+#Group info
+# Map list names to Sample.Source values
+regions <- c(
+  Cervical        = "Spinal_Cord_Cervical",
+  Thoracic        = "Spinal_Cord_Thoracic",
+  Lumbar          = "Spinal_Cord_Lumbar"
+)
+
+sample_list <- list()  #patient data
+expr_list   <- list()  #expression data
+
+for (nm in names(regions)) {
+  src <- regions[[nm]]
+  
+  # subset annotation
+  df <- sample_anno[sample_anno$Sample.Source == src, ]
+  rownames(df) <- df$ExternalSampleId
+  sample_list[[nm]] <- df
+  
+  # subset expression
+  expr_list[[nm]] <- exp_data[, rownames(df)]
+}
+
+# Example: If you still want the individual objects:
+#Cervical <- sample_list[["Cervical"]]
+#exprSet_Cer <- expr_list[["Cervical"]]
+
+# ---------- Gene pair definitions ----------
+# All genes
+genes1 <- c("SPP1", "CD44", 
+           "ITGAV", "ITGA9", "ITGA8", "ITGA5", "ITGB5", "ITGB1",   #Other receptors
+           "RBFOX3","CHAT", "NEFH", "SNAP25", "SYT1", "SYT2", "VAMP1", "STMN2",  "PVALB", "RUNX3", "CALCA", "TRPV1", "POU4F1")#Motor neurons/Neurons
+          
+genes2 <- c( "ALDH1L1", "AQP4", "SLC1A3", "GFAP",   #Pan_astrocyte
+           "C3",  "SERPING1", "GBP2", "HLA-E", "FKBP5",  #A1 Astrocytes
+           "S100A10", "CLU", "SPARCL1", "EMP1", "CD109", "FGF2", "SOCS3", #A2 Astrocytes
+           "P2RY12", "TMEM119", "CX3CR1", "AIF1", "APOE", "TREM2", "CLEC7A", "TYROBP", "ITGAX")   #Microglia
+
+anchors <- c("SPP1", "CD44")
+
+make_pairs <- function(anchor, genes) {
+  lapply(setdiff(genes, anchor), function(g) c(anchor, g))
+}
+
+pairs_SPP1_list1 <- make_pairs("SPP1", genes1)
+pairs_SPP1_list2 <- make_pairs("SPP1", genes2)
+
+pairs_CD44_list1 <- make_pairs("CD44", genes1)
+pairs_CD44_list2 <- make_pairs("CD44", genes2)
+
+# Combine into one list used for correlation calculation
+gene_pairs <- c(
+  pairs_SPP1_list1, pairs_SPP1_list2,
+  pairs_CD44_list1, pairs_CD44_list2
+)
+
+region_order <- names(sample_list)  #Order of regions
+pair_order <- sapply(gene_pairs, function(x) paste(x[1], x[2], sep = " vs ")) #Order of gene pairs 
+
+# ---------- Module (gene set) definitions ----------
+gene_sets <- list(
+  Homeostatic_microglia_score = c("P2RY12", "P2RY13", "TMEM119", "CSF1R", "CX3CR1", "HEXBR", "GPR34", "MERTK"),
+  Disease_associated_microglia_score = c("TREM2", "APOE", "C1QA", "C1QB", "C1QC", "CD68", "AIF1", "TYROBP", "CST7", "LPL", "LGALS3", "CLEC7A", "ITGAX", "AXL", "CTSB", "CTSD", "B2M"),      #Keren-Shaul et al. 2017 (5xFAD scRNA-seq）
+  A1_score  = c("C3", "SERPING1", "GBP2","IFI27","HLA-E","FKBP5","PSMB9","FBLN5"),   #Liddelow et al. 2017 neuroinflammatory + Zeisel 2025 Astrocyte coverage>10%
+  A2_score  = c("S100A10", "CLU", "SPARCL1", "EMP1", "CD109", "FGF2", "SLCO1A2", "TIMP1", "SOCS3", "CLCF1", "B3GNT5"),   #Liddelow et al. 2017 Pan-neuroprotective + Zeisel 2025 Astrocyte coverage>10%
+  Pan_neuron_score = c("SNAP25", "NEFH",  "CHAT","RBFOX3", "VAMP1","SYT1", "SYT2", "MNX1","STMN2"),
+  Non_motor_pan_neuron_score = c("PVALB", "RUNX3", "CALCA", "TRPV1", "P2RX3", "RET", "POU4F1"),
+  Oligodendrocyte_score = c("MOBP", "PLP1", "MBP", "MAG", "MOG", "OLIG1", "OLIG2", "CNP", "MAL")   # Oligodendrocyte lineage
+)
+
+#Full list to be checked:"SPP1", "CD44", "ITGAV", "ITGA9", "ITGA8", "ITGA5", "ITGB5", "ITGB1","P2RY12", "P2RY13", "TMEM119", "CSF1R", "CX3CR1", "HEXBR", "GPR34", "MERTK","TREM2", "APOE", "C1QA", "C1QB", "C1QC", "CD68", "AIF1", "TYROBP", "CST7", "LPL", "LGALS3", "CLEC7A", "ITGAX", "AXL", "CTSB", "CTSD", "B2M","ALDH1L1", "AQP4", "SLC1A3","C3","GFAP",  "SERPING1", "GBP2", "ISG15", "OAS1", "IFI27", "BST2", "HLA-E", "PSMB8", "PSMB9", "CXCL9","GGTA1","LIGP1","FBLN5","UGT1A1","FKBP5","PSMB8","PSMB9","SRGN","AMIGO2","S100A10", "PTX3", "CLU", "SPARCL1", "EMP1", "CD109", "FGF2", "SLCO1A2", "SLC10A6", "CD14", "TIMP1", "SOCS3","CLCF1","TGM1","PTX3","SPHK1","PTGS2","EMP1","SLC10A6","TM4SF1","B3GNT5","CD14",SNAP25", "NEFH", "MAPT", "RBFOX3", "SYT1", "CHAT", "MNX1", "ISL1", "ISL2", "HOXB1","PVALB", "RUNX3", "CALCA", "TRPV1", "P2RX3", "RET", "POU4F1","MOBP", "PLP1", "MBP", "MAG", "MOG", "OLIG1", "OLIG2", "CNP", "MAL"
+
+# Anchors for both analyses
+anchors <- c("SPP1", "CD44")
+
+# ---------- Module scoring ----------
+compute_module_scores <- function(mat, ens_map, gene_sets) {
+  out <- matrix(NA_real_, nrow = ncol(mat), ncol = length(gene_sets))
+  colnames(out) <- names(gene_sets)
+  rownames(out) <- colnames(mat)
+  j <- 0
+  for (nm in names(gene_sets)) {
+    j <- j + 1
+    sym <- gene_sets[[nm]]
+    ids <- ens_map[sym]
+    ids <- ids[!is.na(ids) & ids %in% rownames(mat)]
+    if (length(ids) > 0) out[, j] <- colMeans(mat[ids, , drop = FALSE]) else out[, j] <- NA_real_
+  }
+  out
+}
+
+all_genes <- unique(c(unlist(gene_pairs), unlist(gene_sets)))
+
+ens_map <- mapIds(
+  org.Hs.eg.db,
+  keys = all_genes,
+  column = "ENSEMBL",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+ens_map
+
+failed_genes <- all_genes[!all_genes %in% names(ens_map)]
+print("Genes that failed to map to Ensembl IDs:")
+print(failed_genes)
+
+save(regions, sample_list, expr_list, 
+     genes1, genes2, pairs_SPP1_list1, pairs_SPP1_list2, pairs_CD44_list1, pairs_CD44_list2,
+     gene_pairs, region_order, pair_order, ens_map, gene_sets, anchors, compute_module_scores, file = "20260311_NYGC_RINfiltered_regions_genepairs.RData")
+rm(list=ls())
+```
+
+#----1.4 Testing for covariates: PCA analysis----
+```{r, message= FALSE}
+load("20260311_NYGC_beforeDEG_RINfiltered.RData")
+load("20260311_NYGC_RINfiltered_regions_genepairs.RData")
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+categorical_vars <- c(
+  "Sex",
+  "OnsetSite"
+)
+
+continuous_vars <- c(
+  "RIN",
+  "PMI"
+)
+
+top_variable_genes <- 2000
+
+outdir_pca <- "20260311_PCA_covariates"
+dir.create(outdir_pca, showWarnings = FALSE)
+
+plot_dir <- file.path(outdir_pca, "PCA_plots")
+dir.create(plot_dir, showWarnings = FALSE)
+
+# --------------------------------------------------
+# Helper 1: Run PCA for one region
+# --------------------------------------------------
+run_region_pca <- function(region, expr_list, sample_list, top_n = 2000) {
+  
+  counts <- expr_list[[region]]
+  coldata <- sample_list[[region]]
+  
+  if (is.null(counts) || is.null(coldata)) return(NULL)
+  
+  coldata <- as.data.frame(coldata)
+  coldata <- coldata[colnames(counts), , drop = FALSE]
+  
+    dds <- DESeqDataSetFromMatrix(
+    countData = counts,
+    colData = coldata,
+    design = ~1
+    )
+  dds <- dds[rowSums(counts(dds)) > 10, ]
+  vsd <- vst(dds, blind = TRUE)
+  mat <- assay(vsd)
+  
+  # Select most variable genes
+  vars <- apply(mat, 1, var)
+  top_genes <- names(sort(vars, decreasing = TRUE))[1:min(top_n,length(vars))]
+  mat_top <- mat[top_genes, ]
+  
+  # PCA
+  pca <- prcomp(t(mat_top), scale. = TRUE)
+  pcs <- as.data.frame(pca$x[,1:5])
+  pcs$Sample <- rownames(pcs)
+  
+  meta <- as.data.frame(coldata)
+  meta$Sample <- rownames(meta)
+  
+  df <- left_join(pcs, meta, by="Sample")
+  df$Region <- region
+  
+  # Calculate percentage of variance
+  percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)), 1)
+  
+  list(
+    pca = pca,
+    df = df,
+    percentVar = percentVar
+  )
+}
+
+# --------------------------------------------------
+# Helper 2: Statistical testing of PCs vs covariates
+# --------------------------------------------------
+
+test_pc_assoc <- function(df,vars,type){
+
+  res <- list()
+
+  for(var in vars){
+
+    if(!var %in% colnames(df)) next
+
+    temp <- df %>% filter(!is.na(.data[[var]]))
+    if(nrow(temp)<3) next
+
+    if(type=="continuous"){
+
+      for(pc in c("PC1","PC2","PC3")){
+
+        ct <- suppressWarnings(
+          cor.test(temp[[pc]],temp[[var]],method="spearman")
+        )
+
+        res[[length(res)+1]] <- data.frame(
+          PC=pc,
+          Variable=var,
+          Type="Continuous",
+          N=nrow(temp),
+          Correlation=unname(ct$estimate),
+          Pvalue=ct$p.value
+        )
+      }
+
+    }else{
+
+      temp[[var]] <- as.factor(temp[[var]])
+      if(nlevels(temp[[var]])<2) next
+
+      for(pc in c("PC1","PC2","PC3")){
+
+        fit <- aov(temp[[pc]]~temp[[var]])
+
+        res[[length(res)+1]] <- data.frame(
+          PC=pc,
+          Variable=var,
+          Type="Categorical",
+          N=nrow(temp),
+          Correlation=NA,
+          Pvalue=summary(fit)[[1]][["Pr(>F)"]][1]
+        )
+      }
+    }
+  }
+
+  bind_rows(res)
+}
+
+# --------------------------------------------------
+# Helper 3: Plotting PCA
+# --------------------------------------------------
+
+plot_pca_cont <- function(df, var, region, percentVar) {
+
+  ggplot(df, aes(PC1, PC2, color = .data[[var]])) +
+    geom_point(size = 3, alpha = 0.9) +
+    scale_color_viridis_c() +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste(region, "| PCA colored by", var),
+      x = paste0("PC1: ", percentVar[1], "% variance"),
+      y = paste0("PC2: ", percentVar[2], "% variance"),
+      color = var
+    )
+}
+
+plot_pca_cat <- function(df, var, region, percentVar) {
+
+  ggplot(df, aes(PC1, PC2, color = .data[[var]])) +
+    geom_point(size = 3, alpha = 0.9) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste(region, "| PCA colored by", var),
+      x = paste0("PC1: ", percentVar[1], "% variance"),
+      y = paste0("PC2: ", percentVar[2], "% variance"),
+      color = var
+    )
+}
+
+save_pca_plots <- function(df,region,percentVar,vars,type){
+
+  for(var in vars){
+
+    if(!var %in% colnames(df)) next
+
+    if(type=="continuous"){
+      p <- plot_pca_cont(df,var,region,percentVar)              
+    }else{
+      p <- plot_pca_cat(df,var,region,percentVar)
+    }
+
+    file_name <- paste0(
+      region,"_PCA_",
+      str_replace_all(var,"[^A-Za-z0-9._-]","_"),
+      ".tiff"
+    )
+
+    ggsave(
+      file.path(plot_dir,file_name),
+      p,
+      width=7,
+      height=5,
+      dpi=300
+    )
+  }
+}
+
+# --------------------------------------------------
+# Start working!
+# --------------------------------------------------
+
+#Run PCA
+pca_results <- lapply(region_order,function(region){
+  run_region_pca(region,expr_list,sample_list,top_variable_genes)  #Helper 1
+})
+
+names(pca_results) <- region_order
+pca_results <- pca_results[!sapply(pca_results,is.null)]
+
+
+pc_assoc_results <- list()
+
+for(region in names(pca_results)){
+
+  df <- pca_results[[region]]$df
+  percentVar <- pca_results[[region]]$percentVar
+
+  # association tests
+  cont_res <- test_pc_assoc(df,continuous_vars,"continuous")    #Helper 2
+  cat_res  <- test_pc_assoc(df,categorical_vars,"categorical")
+
+  region_res <- bind_rows(cont_res,cat_res)
+  region_res$Region <- region
+
+  pc_assoc_results[[region]] <- region_res
+
+  # plots
+  save_pca_plots(df,region,percentVar,continuous_vars,"continuous")    #Helper 3
+  save_pca_plots(df,region,percentVar,categorical_vars,"categorical")
+
+}
+
+#Final results in the table
+pc_table <- bind_rows(pc_assoc_results)
+
+if(nrow(pc_table)){
+  pc_table <- pc_table %>%
+    group_by(PC) %>%
+    mutate(Adj.Pvalue=p.adjust(Pvalue,method="BH")) %>%
+    ungroup()
+}
+
+# --------------------------------------------------
+# Save results
+# --------------------------------------------------
+
+write.csv(
+  pc_table,
+  file.path(outdir_pca,"20260311_PCA_covariate_associations.csv"),
+  row.names=FALSE
+)
+
+save(
+  pca_results,
+  pc_table,
+  categorical_vars,
+  continuous_vars,
+  file="20260311_PCA_covariate_analysis.RData"
+)
+
+message("PCA covariate analysis complete.")
+message("Plots saved in: ", plot_dir)
+message("Results table saved in: ", outdir_pca)
+
+# --------------------------------------------------
+# Variance explained by covariates (variancePartition)
+# --------------------------------------------------
+
+library(variancePartition)
+library(BiocParallel)
+
+run_variance_partition <- function(
+  expr_list,
+  sample_list,
+  region_order,
+  covariates = c("RIN", "PMI", "Sex", "OnsetSite"),
+  outdir = ".",
+  n_top = 5000,
+  min_counts = 10,
+  n_cores = 8
+) {
+  # Packages
+  library(DESeq2)
+  library(variancePartition)
+  library(BiocParallel)
+  library(ggplot2)
+  library(matrixStats)
+
+  # Parallel backend for variancePartition / DESeq2
+  register(SnowParam(n_cores))
+
+  if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+  results <- vector("list", length(region_order))
+  names(results) <- region_order
+
+  for (region in region_order) {
+    message("===== Region: ", region, " =====")
+    counts  <- expr_list[[region]]
+    coldata <- sample_list[[region]]
+    if (is.null(counts) || is.null(coldata)) {
+      message("  Skipped: missing counts or coldata")
+      next
+    }
+    
+    # Align samples
+    common_samples <- intersect(colnames(counts), rownames(coldata))
+    if (length(common_samples) == 0) {
+      message("  Skipped: no overlapping samples between counts and coldata")
+      next
+    }
+    counts  <- counts[, common_samples, drop = FALSE]
+    coldata <- coldata[common_samples, , drop = FALSE]
+    
+    # Sanitize column names
+    colnames(coldata) <- make.names(colnames(coldata))
+    
+    # Covariate availability
+    available <- covariates[covariates %in% colnames(coldata)]
+    missing   <- setdiff(covariates, available)
+    if (length(available) == 0) {
+      message("  Skipped: no covariates available in this region")
+      next
+    }
+    if (length(missing) > 0) {
+      message("  Missing covariates: ", paste(missing, collapse = ", "))
+      message("  Using covariates: ", paste(available, collapse = ", "))
+    } else {
+      message("  Using covariates: ", paste(available, collapse = ", "))
+    }
+    
+    # Build formula
+    form_str <- paste("~", paste(available, collapse = " + "))
+    form <- as.formula(form_str)
+    
+    # DESeq2 object
+    dds <- DESeqDataSetFromMatrix(
+      countData = counts,
+      colData = coldata,
+      design = ~1
+    )
+    
+    # Filter low counts
+    keep <- rowSums(counts(dds)) > min_counts
+    dds  <- dds[keep, ]
+    if (nrow(dds) == 0) {
+      message("  Skipped: no genes pass count filter")
+      next
+    }
+    
+    # VST
+    vsd  <- vst(dds, blind = TRUE)
+    expr <- assay(vsd)
+    
+    # Top variable genes (fast)
+    vars <- rowVars(expr)
+    n_top_use <- min(n_top, length(vars))
+    top_idx <- order(vars, decreasing = TRUE)[seq_len(n_top_use)]
+    expr <- expr[top_idx, , drop = FALSE]
+    
+    # Validate model matrix
+    mm <- model.matrix(form, coldata)
+    message("  Model matrix columns: ", paste(colnames(mm), collapse = ", "))
+    
+    # variancePartition
+    varPart <- fitExtractVarPartModel(expr, form, coldata)
+    vp <- sortCols(varPart)
+    
+    # Plot
+    p <- plotVarPart(vp) +
+      ggtitle(paste("Variance explained |", region))
+    outfile <- file.path(outdir, paste0(region, "_variancePartition.tiff"))
+    ggsave(
+      outfile,
+      p,
+      width = 7,
+      height = 5,
+      dpi = 300
+    )
+    message("  Saved plot: ", outfile)
+    results[[region]] <- vp
+  }
+  invisible(results)
+}
+
+varpart_results <- run_variance_partition(
+  expr_list = expr_list,
+  sample_list = sample_list,
+  region_order = region_order,
+  covariates = c("RIN", "PMI", "Sex", "OnsetSite"),
+  outdir = outdir_pca
+)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+variance_summary <- map_df(
+  names(varpart_results),
+  function(region) {
+    vp <- varpart_results[[region]]
+    if (is.null(vp)) return(NULL)
+    vp_df <- as.data.frame(vp)
+    vp_df$Gene <- rownames(vp_df)
+    vp_long <- vp_df %>%
+      pivot_longer(
+        cols = -Gene,
+        names_to = "Covariate",
+        values_to = "VarianceExplained"
+      ) %>%
+      group_by(Covariate) %>%
+      summarize(
+        MeanVariance = mean(VarianceExplained, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(Region = region)
+    vp_long
+  }
+)
+
+variance_summary
+
+save(
+  varpart_results,
+  file="20260311_variancePartition_results.RData"
+)
+
+```
+
+#----1.5 Correlation analysis----
+```{r, message= FALSE}
+#==============================================================
+# 1. Load data
+#==============================================================
+load("20260311_NYGC_beforeDEG_RINfiltered.RData")
+load("20260311_NYGC_RINfiltered_regions_genepairs.RData")
+
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+
+#==============================================================
+# 2. Output directories+Helper: plot a single gene pair scatter and save TIFF
+#==============================================================
+outdir_pairs      <- "1.20260311GenePair_Plots"
+outdir_modules    <- "2.20260311Module_Plots"
+outdir_phenotypes <- "3.20260311Phenotype_Plots"
+dir.create(outdir_pairs, showWarnings = FALSE)
+dir.create(outdir_modules, showWarnings = FALSE)
+dir.create(outdir_phenotypes, showWarnings = FALSE)
+#-----------------------------------------
+# Universal safe filename helper
+#-----------------------------------------
+safe_filename <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+#-----------------------------------------
+# UNIVERSAL Spearman scatter plot helper
+#-----------------------------------------
+plot_corr_scatter <- function(
+    region,
+    var1_name, var2_name,
+    x, y,
+    rho, p, fdr,
+    outdir
+){
+  annotation <- sprintf("ρ = %.2f\np = %.3g\nFDR = %.3g", 
+                        as.numeric(rho), as.numeric(p), as.numeric(fdr))
+
+  df <- data.frame(x = x, y = y)
+
+  p_plot <- ggplot(df, aes(x, y)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    annotate("text", x = Inf, y = -Inf, label = annotation,
+             hjust = 1.1, vjust = -0.5, size = 5) +
+    labs(
+      title = paste(region, ":", var1_name, "vs", var2_name, "(Spearman)"),
+      x = var1_name,
+      y = var2_name
+    ) +
+    theme_bw()
+
+  fname <- paste0(
+    safe_filename(region), "_",
+    safe_filename(var1_name), "_vs_",
+    safe_filename(var2_name), "_Spearman.tiff"
+  )
+
+  tryCatch({
+    tiff(file.path(outdir, fname), width = 8, height = 8,
+         units = "in", res = 300, compression = "lzw")
+    print(p_plot)
+    dev.off()
+  }, error = function(e){
+    message("❌ Error saving ", var1_name, " vs ", var2_name, ": ", e$message)
+  })
+
+  invisible(p_plot)
+}
+
+#==============================================================
+# 3. Helper function for p-value stars
+#==============================================================
+p_to_star <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.0001) return("****")
+  else if (p < 0.001) return("***")
+  else if (p < 0.01) return("**")
+  else if (p < 0.05) return("*")
+  else return("")
+}
+
+#==============================================================
+# 4. Containers for results and VST matrices
+#==============================================================
+vst_list   <- setNames(vector("list", length(region_order)), region_order)
+pheno_list <- setNames(vector("list", length(region_order)), region_order)
+
+results_pairs_by_region      <- list()
+results_modules_by_region    <- list()
+results_phenotypes_by_region <- list()
+
+plot_list_pairs <- list()
+plot_id_pairs   <- 1
+
+#==============================================================
+# 5. Loop over regions
+#==============================================================
+for (region in region_order) {
+  
+  message("Processing region: ", region)
+  
+  counts  <- expr_list[[region]]
+  coldata <- sample_list[[region]]
+  coldata <- coldata[colnames(counts), , drop = FALSE]
+  
+  #------------------------------------------------------------
+  # DESeq2 VST normalization with covariates
+  #------------------------------------------------------------
+  coldata$Sex <- factor(coldata$Sex)
+  coldata$RIN <- as.numeric(coldata$RIN)
+  coldata$PMI <- as.numeric(coldata$PMI)
+  
+  dds <- DESeqDataSetFromMatrix(
+    countData = counts,
+    colData   = coldata,
+    design    = ~ Sex + RIN
+  )
+  dds <- dds[rowSums(counts(dds)) > 10, ]
+  vsd <- vst(dds, blind = FALSE)
+  mat <- assay(vsd)
+  
+  vst_list[[region]]   <- mat
+  pheno_list[[region]] <- coldata
+  
+  #============================================================
+  # A) Gene-pair correlations (Spearman)
+  #============================================================
+  region_results_pairs <- data.frame()
+  
+  for (pair in gene_pairs) {
+    g1 <- pair[1]; g2 <- pair[2]
+    e1 <- ens_map[g1]; e2 <- ens_map[g2]
+    if (!all(c(e1,e2) %in% rownames(mat))) next
+    
+    x <- as.numeric(mat[e1, ])
+    y <- as.numeric(mat[e2, ])
+    
+    ct_s <- suppressWarnings(cor.test(x, y, method = "spearman", exact = FALSE))
+    rho <- unname(ct_s$estimate)
+    p   <- ct_s$p.value
+    
+    region_results_pairs <- rbind(region_results_pairs, data.frame(
+      Region       = region,
+      Gene1        = g1,
+      Gene2        = g2,
+      Ensembl1     = e1,
+      Ensembl2     = e2,
+      Spearman_rho = rho,
+      Spearman_p   = p,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # FDR correction per anchor gene
+  if (nrow(region_results_pairs) > 0) {
+    region_results_pairs <- region_results_pairs %>%
+      group_by(Region, Gene1) %>%
+      mutate(Spearman_p_adj = p.adjust(Spearman_p, method = "BH")) %>%
+      ungroup()
+  }
+  
+sig_pairs <- region_results_pairs %>% filter(Spearman_p_adj < 0.05)
+# Filter significant pairs
+sig_pairs_list1 <- sig_pairs %>% filter(Gene2 %in% genes1)
+sig_pairs_list2 <- sig_pairs %>% filter(Gene2 %in% genes2)
+
+# =========================================
+# Plot SPP1/CD44 vs GENES1
+# =========================================
+if (nrow(sig_pairs_list1) > 0) {
+  message("Region ", region, ": plotting ", nrow(sig_pairs_list1),
+          " significant pairs (GENE LIST 1).")
+  
+  for (i in seq_len(nrow(sig_pairs_list1))) {
+    g1  <- sig_pairs_list1$Gene1[i]
+    g2  <- sig_pairs_list1$Gene2[i]
+    e1  <- sig_pairs_list1$Ensembl1[i]
+    e2  <- sig_pairs_list1$Ensembl2[i]
+
+    x <- as.numeric(mat[e1, ])
+    y <- as.numeric(mat[e2, ])
+
+    plot_corr_scatter(
+      region     = paste0(region, "_Genes1"),
+      var1_name  = g1,
+      var2_name  = g2,
+      x = x, y = y,
+      rho = sig_pairs_list1$Spearman_rho[i],
+      p   = sig_pairs_list1$Spearman_p[i],
+      fdr = sig_pairs_list1$Spearman_p_adj[i],
+      outdir = outdir_pairs
+    )
+  }
+}
+
+# =========================================
+# Plot SPP1/CD44 vs GENES2
+# =========================================
+if (nrow(sig_pairs_list2) > 0) {
+  message("Region ", region, ": plotting ", nrow(sig_pairs_list2),
+          " significant pairs (GENE LIST 2).")
+  
+  for (i in seq_len(nrow(sig_pairs_list2))) {
+    g1  <- sig_pairs_list2$Gene1[i]
+    g2  <- sig_pairs_list2$Gene2[i]
+    e1  <- sig_pairs_list2$Ensembl1[i]
+    e2  <- sig_pairs_list2$Ensembl2[i]
+
+    x <- as.numeric(mat[e1, ])
+    y <- as.numeric(mat[e2, ])
+
+    plot_corr_scatter(
+      region     = paste0(region, "_Genes2"),
+      var1_name  = g1,
+      var2_name  = g2,
+      x = x, y = y,
+      rho = sig_pairs_list2$Spearman_rho[i],
+      p   = sig_pairs_list2$Spearman_p[i],
+      fdr = sig_pairs_list2$Spearman_p_adj[i],
+      outdir = outdir_pairs
+    )
+  }
+}
+
+results_pairs_by_region[[region]] <- region_results_pairs
+  
+  #============================================================
+  # B) Module correlations (Spearman)
+  #============================================================
+  region_results_modules <- data.frame()
+  scores <- compute_module_scores(mat, ens_map, gene_sets) # samples x modules
+  if (ncol(scores) > 0) {
+    for (anchor in anchors) {
+      e_anchor <- ens_map[anchor]
+      if (is.na(e_anchor) || !(e_anchor %in% rownames(mat))) next
+      x_full <- as.numeric(mat[e_anchor, ])
+      
+      for (mod in colnames(scores)) {
+        y_full <- as.numeric(scores[, mod])
+        ok <- is.finite(x_full) & is.finite(y_full)
+        if (sum(ok) < 4) next
+        x <- x_full[ok]; y <- y_full[ok]
+        
+        ct_s <- suppressWarnings(cor.test(x, y, method = "spearman", exact = FALSE))
+        rho <- unname(ct_s$estimate)
+        p   <- ct_s$p.value
+        
+        region_results_modules <- rbind(region_results_modules, data.frame(
+          Region       = region,
+          Anchor       = anchor,
+          Module       = mod,
+          Spearman_rho = rho,
+          Spearman_p   = p,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+    
+    if (nrow(region_results_modules) > 0) {
+      region_results_modules <- region_results_modules %>%
+        group_by(Region, Anchor) %>%
+        mutate(Spearman_p_adj = p.adjust(Spearman_p, method = "BH")) %>%
+        ungroup()
+    }
+  }
+# PLOT SIGNIFICANT ANCHOR–MODULE CORRELATIONS
+sig_mods <- region_results_modules %>% dplyr::filter(Spearman_p_adj < 0.05)
+
+if (nrow(sig_mods) > 0) {
+  message("Region ", region, ": plotting ", nrow(sig_mods),
+          " significant anchor–module pairs (FDR < 0.05)")
+
+  for (i in seq_len(nrow(sig_mods))) {
+    anchor <- sig_mods$Anchor[i]
+    module <- sig_mods$Module[i]
+
+    e_anchor <- ens_map[anchor]
+    x_full <- as.numeric(mat[e_anchor, ])
+    y_full <- as.numeric(scores[, module])
+    ok <- is.finite(x_full) & is.finite(y_full)
+    x <- x_full[ok]; y <- y_full[ok]
+
+    rho <- sig_mods$Spearman_rho[i]
+    p   <- sig_mods$Spearman_p[i]
+    fdr <- sig_mods$Spearman_p_adj[i]
+
+    plot_corr_scatter(
+      region = region,
+      var1_name = anchor,
+      var2_name = module,
+      x = x, y = y,
+      rho = rho, p = p, fdr = fdr,
+      outdir = outdir_modules
+    )
+  }
+} else {
+  message("Region ", region, ": no significant module correlations.")
+}
+  
+  results_modules_by_region[[region]] <- region_results_modules
+  
+  #============================================================
+  # C) Phenotype correlations (Spearman)
+  #============================================================
+  phenotype_vars <- c("Age.at.Symptom.Onset", "Disease.Duration.in.Months")
+  region_results_phenotypes <- data.frame()
+  
+  for (anchor in anchors) {
+    e_anchor <- ens_map[anchor]
+    if (is.na(e_anchor) || !(e_anchor %in% rownames(mat))) next
+    x_full <- as.numeric(mat[e_anchor, ])
+    
+    for (ph in phenotype_vars) {
+      if (!(ph %in% colnames(coldata))) next
+      y_full <- as.numeric(coldata[[ph]])
+      ok <- is.finite(x_full) & is.finite(y_full)
+      if (sum(ok) < 4) next
+      x <- x_full[ok]; y <- y_full[ok]
+      
+      ct_s <- suppressWarnings(cor.test(x, y, method = "spearman", exact = FALSE))
+      rho <- unname(ct_s$estimate)
+      p   <- ct_s$p.value
+      
+      region_results_phenotypes <- rbind(region_results_phenotypes, data.frame(
+        Region       = region,
+        Anchor       = anchor,
+        Phenotype    = ph,
+        Spearman_rho = rho,
+        Spearman_p   = p,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  if (nrow(region_results_phenotypes) > 0) {
+    region_results_phenotypes <- region_results_phenotypes %>%
+      group_by(Region, Anchor) %>%
+      mutate(Spearman_p_adj = p.adjust(Spearman_p, method = "BH")) %>%
+      ungroup()
+  }
+  
+# PLOT SIGNIFICANT ANCHOR–PHENOTYPE CORRELATIONS
+sig_pheno <- region_results_phenotypes %>% 
+  dplyr::filter(Spearman_p_adj < 0.05)
+
+if (nrow(sig_pheno) > 0) {
+  message("Region ", region, ": plotting ", nrow(sig_pheno),
+          " significant anchor–phenotype correlations (FDR < 0.05)")
+
+  for (i in seq_len(nrow(sig_pheno))) {
+    anchor <- sig_pheno$Anchor[i]
+    ph <- sig_pheno$Phenotype[i]
+
+    e_anchor <- ens_map[anchor]
+    x_full <- as.numeric(mat[e_anchor, ])
+    y_full <- as.numeric(coldata[[ph]])
+    ok <- is.finite(x_full) & is.finite(y_full)
+    x <- x_full[ok]; y <- y_full[ok]
+
+    rho <- sig_pheno$Spearman_rho[i]
+    p   <- sig_pheno$Spearman_p[i]
+    fdr <- sig_pheno$Spearman_p_adj[i]
+
+    plot_corr_scatter(
+      region = region,
+      var1_name = anchor,
+      var2_name = ph,
+      x = x, y = y,
+      rho = rho, p = p, fdr = fdr,
+      outdir = outdir_phenotypes
+    )
+  }
+} else {
+  message("Region ", region, ": no significant anchor–phenotype correlations.")
+}
+  
+  results_phenotypes_by_region[[region]] <- region_results_phenotypes
+}
+
+#==============================================================
+# 6. Combine all regions into summary tables
+#==============================================================
+summary_pairs      <- do.call(rbind, results_pairs_by_region)
+summary_modules    <- do.call(rbind, results_modules_by_region)
+summary_phenotypes <- do.call(rbind, results_phenotypes_by_region)
+
+write.csv(summary_pairs,      "GenePair_Spearman_summary.csv", row.names = FALSE)
+write.csv(summary_modules,    "GeneModule_Spearman_summary.csv", row.names = FALSE)
+write.csv(summary_phenotypes, "GenePheno_Spearman_summary.csv", row.names = FALSE)
+
+#==============================================================
+# 7.1 Gene‑pair heatmaps
+#==============================================================
+p_to_star <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.0001) return("****")
+  else if (p < 0.001) return("***")
+  else if (p < 0.01) return("**")
+  else if (p < 0.05) return("*")
+  else return("")
+}
+
+summary_pairs$Pair   <- paste(summary_pairs$Gene1, summary_pairs$Gene2, sep = " vs ")
+summary_pairs$Region <- factor(summary_pairs$Region, levels = region_order)
+summary_pairs$Pair   <- factor(summary_pairs$Pair,   levels = pair_order)
+
+plot_corr_heatmap <- function(summary_table, pair_labels, out_tiff, title_prefix) {
+  tab <- summary_table %>% filter(Pair %in% pair_labels)
+
+  # rho
+  heat_df <- reshape2::dcast(tab, Region ~ Pair, value.var = "Spearman_rho")
+  heat_melt <- reshape2::melt(heat_df, id.vars = "Region",
+                    variable.name = "Pair", value.name = "Spearman_rho")
+
+  # FDR
+  fdr_df <- reshape2::dcast(tab, Region ~ Pair, value.var = "Spearman_p_adj")
+  fdr_melt <- reshape2::melt(fdr_df, id.vars = "Region",
+                   variable.name = "Pair", value.name = "Spearman_p_adj")
+
+  heat_melt <- merge(heat_melt, fdr_melt, by = c("Region", "Pair"), sort = FALSE)
+  heat_melt$stars <- sapply(heat_melt$Spearman_p_adj, p_to_star)
+  heat_melt$rho   <- round(heat_melt$Spearman_rho, 2)
+  
+  p_heat <- ggplot(heat_melt, aes(x = Pair, y = Region, fill = Spearman_rho)) +
+    geom_tile(color = "grey80") +
+  # Rho values on top
+    geom_text(aes(label = rho), size = 4, color = "black") +
+  # Stars slightly below
+    geom_text(aes(label = stars), size = 5, color = "black", nudge_y = 0.25) +
+    scale_fill_gradient2(low = "#0ABFC4", high = "#F7776E", mid = "white",
+                         midpoint = 0, limits = c(-1, 1), na.value = "grey90") +
+    labs(title = NULL, 
+          x = NULL, y = NULL, fill = "Spearman ρ") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+          panel.grid = element_blank())
+
+  tiff(out_tiff, width = 15, height = 3, units = "in", res = 300, compression = "lzw")
+  print(p_heat); dev.off()
+
+  list(plot = p_heat, heat_data = heat_melt)
+}
+
+#Title:SPP1/CD44-gene pair Spearman correlation across regions
+# Build pair labels for each subset
+pair_labels <- function(pairs_list) {
+  sapply(pairs_list, function(x) paste(x[1], x[2], sep = " vs "))
+}
+
+pair_labels_SPP1_list1 <- pair_labels(pairs_SPP1_list1)
+pair_labels_SPP1_list2 <- pair_labels(pairs_SPP1_list2)
+pair_labels_CD44_list1 <- pair_labels(pairs_CD44_list1)
+pair_labels_CD44_list2 <- pair_labels(pairs_CD44_list2)
+
+# Output file names (adjust prefix/date to your convention)
+res_SPP1_pairs_list1 <- plot_corr_heatmap(
+  summary_pairs, pair_labels_SPP1_list1,
+  "20260311Correlation_Heatmap_SPP1_pairs_GENES1.tiff",
+  "SPP1 vs GeneList1"
+)
+
+res_SPP1_pairs_list2 <- plot_corr_heatmap(
+  summary_pairs, pair_labels_SPP1_list2,
+  "20260311Correlation_Heatmap_SPP1_pairs_GENES2.tiff",
+  "SPP1 vs GeneList2"
+)
+
+res_CD44_pairs_list1 <- plot_corr_heatmap(
+  summary_pairs, pair_labels_CD44_list1,
+  "20260311Correlation_Heatmap_CD44_pairs_GENES1.tiff",
+  "CD44 vs GeneList1"
+)
+
+res_CD44_pairs_list2 <- plot_corr_heatmap(
+  summary_pairs, pair_labels_CD44_list2,
+  "20260311Correlation_Heatmap_CD44_pairs_GENES2.tiff",
+  "CD44 vs GeneList2"
+)
+
+# Optionally print to see a ggplot object and the melt data
+res_SPP1_pairs_list1
+res_SPP1_pairs_list2
+res_CD44_pairs_list1
+res_CD44_pairs_list2
+
+#==============================================================
+# 7.2 Module heatmaps (SPP1/CD44 vs modules)
+#==============================================================
+
+plot_module_heatmap <- function(summary_modules, anchor, out_tiff, title_prefix, region_levels = NULL, module_levels = NULL) {
+  tab <- summary_modules %>% filter(Anchor == anchor)
+  if (!is.null(region_levels)) tab$Region <- factor(tab$Region, levels = region_levels)
+  if (!is.null(module_levels)) tab$Module <- factor(tab$Module, levels = module_levels)
+
+  heat_df  <- reshape2::dcast(tab, Region ~ Module, value.var = "Spearman_rho")
+  heat_melt <- reshape2::melt(heat_df, id.vars = "Region",
+                    variable.name = "Module", value.name = "Spearman_rho")
+
+  fdr_df   <- reshape2::dcast(tab, Region ~ Module, value.var = "Spearman_p_adj")
+  fdr_melt <- reshape2::melt(fdr_df, id.vars = "Region",
+                   variable.name = "Module", value.name = "Spearman_p_adj")
+
+  heat_melt <- merge(heat_melt, fdr_melt, by = c("Region", "Module"), sort = FALSE)
+  heat_melt$stars <- sapply(heat_melt$Spearman_p_adj, p_to_star)
+  heat_melt$rho   <- round(heat_melt$Spearman_rho, 2)
+  
+  p_heat <- ggplot(heat_melt, aes(x = Module, y = Region, fill = Spearman_rho)) +
+    geom_tile(color = "grey80") +
+  # Rho values on top
+    geom_text(aes(label = rho), size = 4, color = "black") +
+  # Stars slightly below
+    geom_text(aes(label = stars), size = 5, color = "black", nudge_y = 0.25) +
+    scale_fill_gradient2(low = "#0ABFC4", high = "#F7776E", mid = "white",
+                         midpoint = 0, limits = c(-1, 1), na.value = "grey90") +
+    labs(title = paste0(NULL),
+         x = NULL, y = NULL, fill = "Spearman ρ") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+          panel.grid = element_blank())
+
+  tiff(out_tiff, width = 10, height = 4, units = "in", res = 300, compression = "lzw")
+  print(p_heat); dev.off()
+
+  list(plot = p_heat, heat_data = heat_melt)
+}
+
+region_levels <- region_order
+module_levels <- names(gene_sets)
+
+res_SPP1_modules <- plot_module_heatmap(
+  summary_modules, "SPP1", "20260311Correlation_Heatmap_SPP1_Modules.tiff",
+  "SPP1 vs Module Scores", region_levels, module_levels
+)
+res_CD44_modules <- plot_module_heatmap(
+  summary_modules, "CD44", "20260311Correlation_Heatmap_CD44_Modules.tiff",
+  "CD44 vs Module Scores", region_levels, module_levels
+)
+
+res_SPP1_modules
+res_CD44_modules
+
+#==============================================================
+# 7.3 Phenotype heatmaps (SPP1/CD44 vs phenotypes)
+#==============================================================
+
+plot_pheno_heatmap <- function(summary_phenotypes, anchor, out_tiff, title_prefix,
+                               region_levels = NULL, phenotype_levels = NULL) {
+  tab <- summary_phenotypes %>% dplyr::filter(Anchor == anchor)
+  if (!is.null(region_levels))    tab$Region    <- factor(tab$Region,    levels = region_levels)
+  if (!is.null(phenotype_levels)) tab$Phenotype <- factor(tab$Phenotype, levels = phenotype_levels)
+
+  heat_df   <- reshape2::dcast(tab, Region ~ Phenotype, value.var = "Spearman_rho")
+  heat_melt <- reshape2::melt(heat_df, id.vars = "Region",
+                              variable.name = "Phenotype", value.name = "Spearman_rho")
+
+  fdr_df    <- reshape2::dcast(tab, Region ~ Phenotype, value.var = "Spearman_p_adj")
+  fdr_melt  <- reshape2::melt(fdr_df, id.vars = "Region",
+                              variable.name = "Phenotype", value.name = "Spearman_p_adj")
+
+  heat_melt <- merge(heat_melt, fdr_melt, by = c("Region", "Phenotype"), sort = FALSE)
+  heat_melt$stars <- sapply(heat_melt$Spearman_p_adj, p_to_star)
+  heat_melt$rho   <- round(heat_melt$Spearman_rho, 2)
+  
+  p_heat <- ggplot(heat_melt, aes(x = Phenotype, y = Region, fill = Spearman_rho)) +
+    geom_tile(color = "grey80") +
+  # Rho values on top
+    geom_text(aes(label = rho), size = 4, color = "black") +
+  # Stars slightly below
+    geom_text(aes(label = stars), size = 5, color = "black", nudge_y = 0.25) +
+    scale_fill_gradient2(low = "#0ABFC4", high = "#F7776E", mid = "white",
+                       midpoint = 0, limits = c(-1, 1), na.value = "grey90") +
+    labs(title = paste0(title_prefix),
+       x = NULL, y = NULL, fill = "Spearman ρ") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid = element_blank())
+
+  tiff(out_tiff, width = 5, height = 3, units = "in", res = 300, compression = "lzw")
+  print(p_heat); dev.off()
+
+  list(plot = p_heat, heat_data = heat_melt)
+}
+
+phenotype_levels <- c("Age.at.Symptom.Onset", "Disease.Duration.in.Months")
+region_levels    <- region_order
+
+res_SPP1_phenotypes <- plot_pheno_heatmap(
+  summary_phenotypes, "SPP1", "20260311Correlation_Heatmap_SPP1_Phenotypes.tiff",
+  "SPP1 vs Phenotypes", region_levels, phenotype_levels
+)
+res_CD44_phenotypes <- plot_pheno_heatmap(
+  summary_phenotypes, "CD44", "20260311Correlation_Heatmap_CD44_Phenotypes.tiff",
+  "CD44 vs Phenotypes", region_levels, phenotype_levels
+)
+
+res_SPP1_phenotypes
+res_CD44_phenotypes
+
+#==============================================================
+# 8. saving objects
+#==============================================================
+
+save(vst_list, pheno_list, ens_map, region_order, pair_order, gene_pairs,
+     results_pairs_by_region, results_modules_by_region, results_phenotypes_by_region,
+     summary_pairs, summary_modules, summary_phenotypes,
+     res_SPP1_pairs_list1, res_SPP1_pairs_list2,
+     res_CD44_pairs_list1, res_CD44_pairs_list2,
+     res_SPP1_modules, res_CD44_modules,
+     res_SPP1_phenotypes, res_CD44_phenotypes,
+     file = "2026311_GenePair_Module_Pheno_Corr_results_Output.RData")
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
