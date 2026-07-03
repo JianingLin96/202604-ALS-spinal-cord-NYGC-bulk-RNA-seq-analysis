@@ -1,0 +1,1084 @@
+---
+title: "RNAseq analysis for NYGC dataset - SC only - Spearman (Sex adjusted)"
+author: "Jianing"
+date: "2026-0622"
+output: html_document
+---
+
+Dataset sources:  
+- GSE272626: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE272626  
+- Paper1: https://www.nature.com/articles/s41593-022-01205-3  
+- Paper2: https://academic.oup.com/brain/article/146/9/3770/7072405  
+--0622 note: update all correlation analysis-use limma correct expression, and Cox-use the VST only and the covariates in the formula
+---
+
+# 1.1 Load packages
+
+```{r, message=FALSE}
+library(sva); library(GEOquery); library(FactoMineR); library(factoextra)
+library(tidyverse); library(pheatmap); library(edgeR); library(RColorBrewer)
+library(readxl); library(limma); library(affy); library(stringr)
+library(DESeq2); library(readr); library(ggplot2); library(dplyr)
+library(lookup); library(org.Hs.eg.db); library(clusterProfiler)
+library(AnnotationDbi); library(data.table); library(enrichplot)
+library(ggstatsplot); library(ggpubr); library(tidyr); library(tibble)
+```
+
+---
+
+# 1.2 Prepare dataset
+
+```{r, message=FALSE}
+# NOTE 20260601: "Jan24_Complete_counts_matrix.tsv" excluded SOD1 samples;
+# using "Counts_file_DGE_March2023.tsv" for broader gene/sample coverage.
+exp_data <- read.table("Counts_file_DGE_March2023.tsv", header = TRUE, check.names = FALSE)
+pdata    <- read.csv("Target ALS RNA Metadata 05272022.csv", header = TRUE)
+
+# Match samples and remove duplicates
+matched_pdata <- pdata[pdata$ExternalSampleId %in% colnames(exp_data), ]
+matched_pdata <- matched_pdata[!duplicated(matched_pdata$ExternalSampleId), ]
+write.csv(matched_pdata, "20260622NYGC_all_pdata.csv", row.names = FALSE)
+
+# ---------- Filtering ----------
+matched_pdata$RIN                          <- as.numeric(as.character(matched_pdata$RIN))
+matched_pdata$Post.Mortem.Interval.in.Hours <- as.numeric(as.character(matched_pdata$Post.Mortem.Interval.in.Hours))
+
+matched_pdata <- matched_pdata %>%
+  filter(
+    RIN >= 5,
+    Post.Mortem.Interval.in.Hours <= 12,
+    Subject.Group.Subcategory == "Classical/Typical ALS",
+    Sample.Source %in% c("Spinal_Cord_Cervical", "Spinal_Cord_Thoracic", "Spinal_Cord_Lumbar"),
+    !grepl("Positive for C9orf72 Repeat Expansion",
+           Reported.Genomic.Mutations..from.sites...NOT.in.any.way.associated.with.WGS.data.from.NYGC.),
+    !grepl("Positive for SOD1",
+           Reported.Genomic.Mutations..from.sites...NOT.in.any.way.associated.with.WGS.data.from.NYGC.),
+    !grepl("Yes", C9orf72.Repeat.Expansion..Data.from.CUMC.)
+  )
+
+# ---------- Build sample annotation ----------
+sample_anno <- matched_pdata %>%
+  select(ExternalSampleId, ExternalSubjectId, NeuroBankID, Sex,
+         Site.of.Motor.Onset, Age.at.Symptom.Onset, Age.at.Death,
+         Sample.Source, RIN, Disease.Duration.in.Months,
+         Post.Mortem.Interval.in.Hours) %>%
+  rename(PMI = Post.Mortem.Interval.in.Hours, OnsetSite = Site.of.Motor.Onset) %>%
+  mutate(
+    Sex           = factor(Sex),
+    # Collapse axial-combined categories into their dominant onset type
+    OnsetSite     = case_when(
+      OnsetSite %in% c("Bulbar", "Axial and Bulbar") ~ "Bulbar",
+      OnsetSite %in% c("Limb",   "Axial and Limb")   ~ "Limb",
+      TRUE ~ as.character(OnsetSite)
+    ),
+    OnsetSite     = factor(OnsetSite),
+    Sample.Source = factor(Sample.Source),
+    across(c(Age.at.Symptom.Onset, Age.at.Death, RIN,
+             Disease.Duration.in.Months, PMI), as.numeric)
+  )%>%
+   filter(OnsetSite %in% c("Bulbar", "Limb"))
+write.csv(sample_anno, "20260622NYGC_filtered.csv", row.names = FALSE)
+
+# ---------- Table 1: clinical summary ----------
+library(tableone)
+table1 <- CreateTableOne(
+  vars       = c("Sex", "OnsetSite", "Age.at.Symptom.Onset", "Age.at.Death",
+                 "RIN", "Disease.Duration.in.Months", "PMI"),
+  strata     = "Sample.Source",
+  data       = sample_anno,
+  factorVars = c("Sex", "OnsetSite")
+)
+table1_mat <- print(table1,
+                    nonnormal   = c("PMI", "Disease.Duration.in.Months"),
+                    showAllLevels = TRUE, quote = FALSE,
+                    noSpaces = TRUE, printToggle = FALSE)
+write.csv(table1_mat, "Table1_clinical_summary.csv")
+
+save(exp_data, pdata, matched_pdata, sample_anno, table1_mat,
+     file = "20260622_NYGC_beforeDEG_RINfiltered.RData")
+```
+
+---
+
+# 1.3 Define regions, gene pairs and modules
+
+```{r, message=FALSE}
+load("20260622_NYGC_beforeDEG_RINfiltered.RData")
+
+# ---------- Region → Sample.Source mapping ----------
+regions <- c(
+  Cervical = "Spinal_Cord_Cervical",
+  Thoracic = "Spinal_Cord_Thoracic",
+  Lumbar   = "Spinal_Cord_Lumbar"
+)
+
+sample_list <- list()
+expr_list   <- list()
+for (nm in names(regions)) {
+  df <- sample_anno[sample_anno$Sample.Source == regions[[nm]], ]
+  rownames(df) <- df$ExternalSampleId
+  sample_list[[nm]] <- df
+  expr_list[[nm]]   <- exp_data[, rownames(df)]
+}
+
+# ---------- Gene lists ----------
+genes1 <- c("SPP1", "CD44",
+            "ITGAV", "ITGA9", "ITGA8", "ITGA5", "ITGB5", "ITGB1",
+            "RBFOX3", "CHAT", "NEFH", "SNAP25", "SYT1", "SYT2", "VAMP1",
+            "STMN2", "PVALB", "RUNX3", "CALCA", "TRPV1", "POU4F1")
+
+genes2 <- c("ALDH1L1", "AQP4", "SLC1A3", "GFAP",
+            "C3", "SERPING1", "GBP2", "HLA-E", "FKBP5",
+            "S100A10", "CLU", "SPARCL1", "EMP1", "CD109", "FGF2", "SOCS3",
+            "P2RY12", "TMEM119", "CX3CR1", "AIF1", "APOE", "TREM2",
+            "CLEC7A", "TYROBP", "ITGAX")
+
+anchors <- c("SPP1", "CD44")
+
+make_pairs <- function(anchor, genes) lapply(setdiff(genes, anchor), function(g) c(anchor, g))
+
+pairs_SPP1_list1 <- make_pairs("SPP1", genes1)
+pairs_SPP1_list2 <- make_pairs("SPP1", genes2)
+pairs_CD44_list1 <- make_pairs("CD44", genes1)
+pairs_CD44_list2 <- make_pairs("CD44", genes2)
+
+gene_pairs <- c(pairs_SPP1_list1, pairs_SPP1_list2, pairs_CD44_list1, pairs_CD44_list2)
+
+region_order <- names(sample_list)
+pair_order   <- sapply(gene_pairs, function(x) paste(x[1], x[2], sep = " vs "))
+
+# ---------- Module (gene set) definitions ----------
+gene_sets <- list(
+  Homeostatic_microglia_score = c("P2RY12", "CSF1R","CX3CR1"),
+  Disease_associated_microglia_score = c("TREM2", "APOE", "C1QA", "C1QB", "C1QC", "CD68", "AIF1", "TYROBP", "CST7", "LPL", "LGALS3", "CLEC7A", "ITGAX", "AXL", "CTSB", "CTSD", "B2M"),
+  Activated_astrocyte_score = c("C3", "SERPING1", "GBP2", "IFI27", "HLA-E", "FKBP5", "PSMB9", "FBLN5", "S100A10", "CLU", "SPARCL1", "EMP1", "CD109", "FGF2", "SLCO1A2","TIMP1", "SOCS3", "CLCF1", "B3GNT5"),
+  Pan_neuron_score = c("SNAP25", "NEFH", "CHAT", "RBFOX3", "VAMP1", "SYT1", "SYT2", "MNX1", "STMN2"),
+  Non_motor_pan_neuron_score = c("PVALB", "RUNX3", "CALCA", "TRPV1", "P2RX3", "RET", "POU4F1"),
+  Oligodendrocyte_score = c("MOBP", "PLP1", "MBP", "MAG", "MOG", "OLIG1", "OLIG2", "CNP", "MAL")
+)
+
+# ---------- Module scoring helper ----------
+compute_module_scores <- function(mat, ens_map, gene_sets) {
+  out <- matrix(NA_real_, nrow = ncol(mat), ncol = length(gene_sets),
+                dimnames = list(colnames(mat), names(gene_sets)))
+  for (nm in names(gene_sets)) {
+    ids <- ens_map[gene_sets[[nm]]]
+    ids <- ids[!is.na(ids) & ids %in% rownames(mat)]
+    if (length(ids) > 0) out[, nm] <- colMeans(mat[ids, , drop = FALSE])
+  }
+  out
+}
+
+# ---------- Ensembl ID mapping ----------
+all_genes <- unique(c(unlist(gene_pairs), unlist(gene_sets)))
+ens_map   <- mapIds(org.Hs.eg.db, keys = all_genes,
+                    column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first")
+print("Genes that failed to map to Ensembl IDs:")
+print(all_genes[!all_genes %in% names(ens_map)])
+
+save(regions, sample_list, expr_list,
+     genes1, genes2,
+     pairs_SPP1_list1, pairs_SPP1_list2, pairs_CD44_list1, pairs_CD44_list2,
+     gene_pairs, region_order, pair_order, ens_map, gene_sets, anchors,
+     compute_module_scores,
+     file = "20260622_NYGC_RINfiltered_regions_genepairs.RData")
+rm(list = ls())
+```
+
+---
+
+# 1.4 PCA covariate analysis
+
+```{r, message=FALSE}
+load("20260622_NYGC_beforeDEG_RINfiltered.RData")
+load("20260622_NYGC_RINfiltered_regions_genepairs.RData")
+
+categorical_vars    <- c("Sex", "OnsetSite")
+continuous_vars     <- c("RIN", "PMI")
+top_variable_genes  <- 2000
+outdir_pca          <- "20260622_PCA_covariates"
+plot_dir            <- file.path(outdir_pca, "PCA_plots")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ---------- Helper: Run PCA for one region ----------
+run_region_pca <- function(region, expr_list, sample_list, top_n = 2000) {
+  counts  <- expr_list[[region]]
+  coldata <- as.data.frame(sample_list[[region]])[colnames(counts), , drop = FALSE]
+
+  dds <- DESeqDataSetFromMatrix(countData = counts, colData = coldata, design = ~1)
+  dds <- dds[rowSums(counts(dds)) > 10, ]
+  mat <- assay(vst(dds, blind = TRUE))
+
+  top_genes <- names(sort(apply(mat, 1, var), decreasing = TRUE))[1:min(top_n, nrow(mat))]
+  pca       <- prcomp(t(mat[top_genes, ]), scale. = TRUE)
+  percentVar <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+  df <- as.data.frame(pca$x[, 1:5]) %>%
+    rownames_to_column("Sample") %>%
+    left_join(rownames_to_column(as.data.frame(coldata), "Sample"), by = "Sample") %>%
+    mutate(Region = region)
+
+  list(pca = pca, df = df, percentVar = percentVar)
+}
+
+# ---------- Helper: PC association tests ----------
+test_pc_assoc <- function(df, vars, type) {
+  bind_rows(lapply(vars, function(var) {
+    if (!var %in% colnames(df)) return(NULL)
+    temp <- df[!is.na(df[[var]]), ]
+    if (nrow(temp) < 3) return(NULL)
+    bind_rows(lapply(c("PC1", "PC2", "PC3"), function(pc) {
+      if (type == "continuous") {
+        ct <- suppressWarnings(cor.test(temp[[pc]], temp[[var]], method = "spearman"))
+        data.frame(PC = pc, Variable = var, Type = "Continuous",
+                   N = nrow(temp), Correlation = unname(ct$estimate), Pvalue = ct$p.value)
+      } else {
+        temp[[var]] <- as.factor(temp[[var]])
+        if (nlevels(temp[[var]]) < 2) return(NULL)
+        fit <- aov(temp[[pc]] ~ temp[[var]])
+        data.frame(PC = pc, Variable = var, Type = "Categorical",
+                   N = nrow(temp), Correlation = NA,
+                   Pvalue = summary(fit)[[1]][["Pr(>F)"]][1])
+      }
+    }))
+  }))
+}
+
+# ---------- Helper: Save PCA plots ----------
+save_pca_plots <- function(df, region, percentVar, vars, type) {
+  for (var in vars) {
+    if (!var %in% colnames(df)) next
+    p <- ggplot(df, aes(PC1, PC2, color = .data[[var]])) +
+      geom_point(size = 3, alpha = 0.9) +
+      { if (type == "continuous") scale_color_viridis_c() } +
+      theme_bw(base_size = 13) +
+      labs(title = paste(region, "| PCA colored by", var),
+           x = paste0("PC1: ", percentVar[1], "% variance"),
+           y = paste0("PC2: ", percentVar[2], "% variance"), color = var)
+    ggsave(file.path(plot_dir, paste0(region, "_PCA_",
+                                      str_replace_all(var, "[^A-Za-z0-9._-]", "_"), ".tiff")),
+           p, width = 7, height = 5, dpi = 300)
+  }
+}
+
+# ---------- Run ----------
+pca_results <- setNames(
+  lapply(region_order, run_region_pca, expr_list = expr_list,
+         sample_list = sample_list, top_n = top_variable_genes),
+  region_order
+)
+pca_results <- pca_results[!sapply(pca_results, is.null)]
+
+# ---------- Samples included in §1.4 PCA / variancePartition (per region) ----------
+n_samples_pca <- do.call(rbind, lapply(names(pca_results), function(region) {
+  data.frame(Region = region, n_samples = nrow(pca_results[[region]]$df))
+}))
+print(n_samples_pca)
+write.csv(n_samples_pca, file.path(outdir_pca, "20260622_n_samples_PCA.csv"),
+          row.names = FALSE)
+
+pc_assoc_results <- lapply(names(pca_results), function(region) {
+  df  <- pca_results[[region]]$df
+  pv  <- pca_results[[region]]$percentVar
+  res <- bind_rows(test_pc_assoc(df, continuous_vars, "continuous"),
+                   test_pc_assoc(df, categorical_vars, "categorical")) %>%
+    mutate(Region = region)
+  save_pca_plots(df, region, pv, continuous_vars, "continuous")
+  save_pca_plots(df, region, pv, categorical_vars, "categorical")
+  res
+})
+
+pc_table <- bind_rows(pc_assoc_results) %>%
+  group_by(PC) %>%
+  mutate(Adj.Pvalue = p.adjust(Pvalue, method = "BH")) %>%
+  ungroup()
+
+write.csv(pc_table, file.path(outdir_pca, "20260622_PCA_covariate_associations.csv"), row.names = FALSE)
+
+# ---------- variancePartition ----------
+library(variancePartition); library(BiocParallel); library(matrixStats)
+register(SnowParam(8))
+
+varpart_results <- setNames(vector("list", length(region_order)), region_order)
+for (region in region_order) {
+  counts  <- expr_list[[region]]
+  coldata <- as.data.frame(sample_list[[region]])
+  common  <- intersect(colnames(counts), rownames(coldata))
+  counts  <- counts[, common, drop = FALSE]
+  coldata <- coldata[common, , drop = FALSE]
+  colnames(coldata) <- make.names(colnames(coldata))
+
+  available <- c("RIN", "PMI", "Sex", "OnsetSite")[c("RIN", "PMI", "Sex", "OnsetSite") %in% colnames(coldata)]
+  if (length(available) == 0) next
+
+  dds  <- DESeqDataSetFromMatrix(counts, coldata, ~1)
+  dds  <- dds[rowSums(counts(dds)) > 10, ]
+  expr <- assay(vst(dds, blind = TRUE))
+  expr <- expr[order(rowVars(expr), decreasing = TRUE)[1:min(2000, nrow(expr))], ]
+
+  form    <- as.formula(paste("~", paste(available, collapse = " + ")))
+  varPart <- fitExtractVarPartModel(expr, form, coldata)
+  vp      <- sortCols(varPart)
+
+  p <- plotVarPart(vp) + ggtitle(paste("Variance explained |", region))
+  ggsave(file.path(outdir_pca, paste0(region, "_variancePartition.tiff")),
+         p, width = 7, height = 5, dpi = 300)
+  varpart_results[[region]] <- vp
+}
+
+variance_summary <- map_df(names(varpart_results), function(region) {
+  vp <- varpart_results[[region]]
+  if (is.null(vp)) return(NULL)
+  as.data.frame(vp) %>%
+    rownames_to_column("Gene") %>%
+    pivot_longer(-Gene, names_to = "Covariate", values_to = "VarianceExplained") %>%
+    group_by(Covariate) %>%
+    summarize(MeanVariance = mean(VarianceExplained, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Region = region)
+})
+variance_summary
+
+save(pca_results, pc_table, varpart_results, variance_summary,
+     categorical_vars, continuous_vars,
+     file = "20260622_PCA_covariate_analysis.RData")
+message("PCA covariate analysis complete. Plots in: ", plot_dir)
+```
+
+---
+
+# 1.5 Correlation analysis
+
+```{r, message=FALSE}
+load("20260622_NYGC_beforeDEG_RINfiltered.RData")
+load("20260622_NYGC_RINfiltered_regions_genepairs.RData")
+library(DESeq2); library(dplyr); library(ggplot2); library(reshape2)
+
+# ---------- Output directories ----------
+outdir_pairs      <- "1.20260622GenePair_Plots"
+outdir_modules    <- "2.20260622Module_Plots"
+outdir_phenotypes <- "3.20260622Phenotype_Plots"
+for (d in c(outdir_pairs, outdir_modules, outdir_phenotypes))
+  dir.create(d, showWarnings = FALSE)
+
+# ---------- Helpers ----------
+safe_filename <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+p_to_star <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.0001) "****" else if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else ""
+}
+
+plot_corr_scatter <- function(region, var1_name, var2_name, x, y, rho, p, fdr, outdir) {
+  df      <- data.frame(x = x, y = y)
+  annotation <- sprintf("\u03c1 = %.2f\np = %.3g\nFDR = %.3g", as.numeric(rho), as.numeric(p), as.numeric(fdr))
+  p_plot  <- ggplot(df, aes(x, y)) +
+    geom_point(alpha = 0.7, size = 3) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    annotate("text", x = Inf, y = Inf, label = annotation, hjust = 1.1, vjust = 1.5, size = 6) +
+    labs(title = paste(region, ":", var1_name, "vs", var2_name, "(Spearman)"),
+         x = var1_name, y = var2_name) +
+    theme_bw(base_size = 14) +
+    theme(
+      axis.text.x  = element_text(size = 14),   # x-axis tick labels
+      axis.text.y  = element_text(size = 14))  # y-axis tick labels
+  fname <- paste0(safe_filename(region), "_", safe_filename(var1_name),
+                  "_vs_", safe_filename(var2_name), "_Spearman.tiff")
+  tryCatch({
+    tiff(file.path(outdir, fname), width = 8, height = 8, units = "in", res = 300, compression = "lzw")
+    print(p_plot); dev.off()
+  }, error = function(e) message("Error saving ", var1_name, " vs ", var2_name, ": ", e$message))
+  invisible(p_plot)
+}
+
+# ---------- Containers ----------
+vst_list   <- setNames(vector("list", length(region_order)), region_order)
+pheno_list <- setNames(vector("list", length(region_order)), region_order)
+results_pairs_by_region      <- list()
+results_modules_by_region    <- list()
+results_phenotypes_by_region <- list()
+
+# ---------- Main loop over regions ----------
+for (region in region_order) {
+  message("Processing region: ", region)
+
+  counts  <- expr_list[[region]]
+  coldata <- sample_list[[region]][colnames(counts), , drop = FALSE]
+  coldata$Sex <- factor(coldata$Sex)
+
+  dds <- DESeqDataSetFromMatrix(countData = counts, colData = coldata, design = ~ Sex)
+  dds <- dds[rowSums(counts(dds)) > 10, ]
+  mat <- assay(vst(dds, blind = FALSE))
+  vst_list[[region]]   <- mat          # RAW VST kept for §1.6 Cox (covariates go in-formula)
+  pheno_list[[region]] <- coldata
+
+  # ---- Covariate adjustment for the correlation input ----------------------
+  # The DESeq design (~ Sex) only informs dispersion estimation; the VST values
+  # themselves are NOT covariate-adjusted. Because the gene-gene, gene-module and
+  # gene-phenotype correlations below use the expression values directly, we
+  # regress Sex out of the VST matrix with limma::removeBatchEffect so the
+  # correlations are not driven by it. RIN and PMI are NOT adjusted for here
+  # (RIN removed by request; PMI negligible per the §1.4 variancePartition).
+  #   batch = Sex (categorical -> dummy-coded internally, one offset)
+  # `mat` is REASSIGNED to the adjusted matrix for blocks A/B/C; vst_list still
+  # holds the RAW VST so §1.6 Cox can adjust for Sex in the model formula.
+  adj_batch <- factor(coldata[colnames(mat), "Sex"])
+  mat <- limma::removeBatchEffect(
+    mat,
+    batch = if (nlevels(adj_batch) > 1) adj_batch else NULL
+  )
+
+  #--- A) Gene-pair correlations ---
+  region_results_pairs <- bind_rows(lapply(gene_pairs, function(pair) {
+    g1 <- pair[1]; g2 <- pair[2]
+    e1 <- ens_map[g1]; e2 <- ens_map[g2]
+    if (!all(c(e1, e2) %in% rownames(mat))) return(NULL)
+    ct <- suppressWarnings(cor.test(mat[e1, ], mat[e2, ], method = "spearman", exact = FALSE))
+    data.frame(Region = region, Gene1 = g1, Gene2 = g2,
+               Ensembl1 = e1, Ensembl2 = e2,
+               Spearman_rho = unname(ct$estimate), Spearman_p = ct$p.value,
+               stringsAsFactors = FALSE)
+  }))
+
+  if (nrow(region_results_pairs) > 0) {
+    region_results_pairs <- region_results_pairs %>%
+      group_by(Region, Gene1) %>%
+      mutate(Spearman_p_adj = p.adjust(Spearman_p, method = "BH")) %>%
+      ungroup()
+    # Plot significant pairs
+    sig_pairs <- region_results_pairs %>% filter(Spearman_p_adj < 0.05)
+    for (lst in list(filter(sig_pairs, Gene2 %in% genes1), filter(sig_pairs, Gene2 %in% genes2))) {
+      if (nrow(lst) == 0) next
+      for (i in seq_len(nrow(lst))) {
+        x <- mat[lst$Ensembl1[i], ]; y <- mat[lst$Ensembl2[i], ]
+        plot_corr_scatter(region, lst$Gene1[i], lst$Gene2[i], x, y,
+                          lst$Spearman_rho[i], lst$Spearman_p[i], lst$Spearman_p_adj[i],
+                          outdir_pairs)
+      }
+    }
+  }
+  results_pairs_by_region[[region]] <- region_results_pairs
+
+  #--- B) Module correlations ---
+  scores <- compute_module_scores(mat, ens_map, gene_sets)
+  region_results_modules <- bind_rows(lapply(anchors, function(anchor) {
+    e_anchor <- ens_map[anchor]
+    if (is.na(e_anchor) || !(e_anchor %in% rownames(mat))) return(NULL)
+    x_full <- as.numeric(mat[e_anchor, ])
+    bind_rows(lapply(colnames(scores), function(mod) {
+      y_full <- as.numeric(scores[, mod])
+      ok <- is.finite(x_full) & is.finite(y_full)
+      if (sum(ok) < 4) return(NULL)
+      ct <- suppressWarnings(cor.test(x_full[ok], y_full[ok], method = "spearman", exact = FALSE))
+      data.frame(Region = region, Anchor = anchor, Module = mod,
+                 Spearman_rho = unname(ct$estimate), Spearman_p = ct$p.value,
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+
+  if (nrow(region_results_modules) > 0) {
+    region_results_modules <- region_results_modules %>%
+      group_by(Region, Anchor) %>%
+      mutate(Spearman_p_adj = p.adjust(Spearman_p, method = "BH")) %>%
+      ungroup()
+    sig_mods <- filter(region_results_modules, Spearman_p_adj < 0.05)
+    if (nrow(sig_mods) > 0) {
+      for (i in seq_len(nrow(sig_mods))) {
+        e_anchor <- ens_map[sig_mods$Anchor[i]]
+        x <- as.numeric(mat[e_anchor, ]); y <- as.numeric(scores[, sig_mods$Module[i]])
+        ok <- is.finite(x) & is.finite(y)
+        plot_corr_scatter(region, sig_mods$Anchor[i], sig_mods$Module[i], x[ok], y[ok],
+                          sig_mods$Spearman_rho[i], sig_mods$Spearman_p[i], sig_mods$Spearman_p_adj[i],
+                          outdir_modules)
+      }
+    }
+  }
+  results_modules_by_region[[region]] <- region_results_modules
+
+  #--- C) Phenotype correlations ---
+  phenotype_vars <- c("Age.at.Symptom.Onset", "Disease.Duration.in.Months")
+  region_results_phenotypes <- bind_rows(lapply(anchors, function(anchor) {
+    e_anchor <- ens_map[anchor]
+    if (is.na(e_anchor) || !(e_anchor %in% rownames(mat))) return(NULL)
+    x_full <- as.numeric(mat[e_anchor, ])
+    bind_rows(lapply(phenotype_vars, function(ph) {
+      if (!(ph %in% colnames(coldata))) return(NULL)
+      y_full <- as.numeric(coldata[[ph]])
+      ok <- is.finite(x_full) & is.finite(y_full)
+      if (sum(ok) < 4) return(NULL)
+      ct <- suppressWarnings(cor.test(x_full[ok], y_full[ok], method = "spearman", exact = FALSE))
+      data.frame(Region = region, Anchor = anchor, Phenotype = ph,
+                 Spearman_rho = unname(ct$estimate), Spearman_p = ct$p.value,
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+
+  if (nrow(region_results_phenotypes) > 0) {
+    region_results_phenotypes <- region_results_phenotypes %>%
+      group_by(Region, Anchor) %>%
+      mutate(Spearman_p_adj = p.adjust(Spearman_p, method = "BH")) %>%
+      ungroup()
+    sig_pheno <- filter(region_results_phenotypes, Spearman_p_adj < 0.05)
+    if (nrow(sig_pheno) > 0) {
+      for (i in seq_len(nrow(sig_pheno))) {
+        e_anchor <- ens_map[sig_pheno$Anchor[i]]
+        x <- as.numeric(mat[e_anchor, ]); y <- as.numeric(coldata[[sig_pheno$Phenotype[i]]])
+        ok <- is.finite(x) & is.finite(y)
+        plot_corr_scatter(region, sig_pheno$Anchor[i], sig_pheno$Phenotype[i], x[ok], y[ok],
+                          sig_pheno$Spearman_rho[i], sig_pheno$Spearman_p[i], sig_pheno$Spearman_p_adj[i],
+                          outdir_phenotypes)
+      }
+    }
+  }
+  results_phenotypes_by_region[[region]] <- region_results_phenotypes
+}
+
+# ---------- Combine & save CSVs ----------
+summary_pairs      <- do.call(rbind, results_pairs_by_region)
+summary_modules    <- do.call(rbind, results_modules_by_region)
+summary_phenotypes <- do.call(rbind, results_phenotypes_by_region)
+
+write.csv(summary_pairs,      "GenePair_Spearman_summary.csv",  row.names = FALSE)
+write.csv(summary_modules,    "GeneModule_Spearman_summary.csv", row.names = FALSE)
+write.csv(summary_phenotypes, "GenePheno_Spearman_summary.csv",  row.names = FALSE)
+
+# ---------- Samples included in §1.5 correlation analysis (per region) ----------
+# n_samples = samples entering the VST + Sex adjustment per region.
+# Gene-pair / module use all of them; phenotype correlations use the subset with
+# a non-missing phenotype (Spearman uses complete pairs only).
+n_samples_corr <- do.call(rbind, lapply(region_order, function(r) {
+  cd <- pheno_list[[r]]
+  data.frame(
+    Region      = r,
+    n_samples   = nrow(cd),
+    n_Female    = sum(cd$Sex == "Female", na.rm = TRUE),
+    n_Male      = sum(cd$Sex == "Male",   na.rm = TRUE),
+    n_AgeOnset  = sum(!is.na(cd$Age.at.Symptom.Onset)),
+    n_Duration  = sum(!is.na(cd$Disease.Duration.in.Months))
+  )
+}))
+print(n_samples_corr)
+write.csv(n_samples_corr, "20260622_n_samples_correlation.csv", row.names = FALSE)
+
+# ---------- Heatmap helpers ----------
+plot_corr_heatmap <- function(summary_table, pair_labels, out_tiff, w = 15, h = 3) {
+  tab <- summary_table %>% filter(Pair %in% pair_labels)
+  heat_melt <- reshape2::melt(reshape2::dcast(tab, Region ~ Pair, value.var = "Spearman_rho"),
+                               id.vars = "Region", variable.name = "Pair", value.name = "Spearman_rho")
+  fdr_melt  <- reshape2::melt(reshape2::dcast(tab, Region ~ Pair, value.var = "Spearman_p_adj"),
+                               id.vars = "Region", variable.name = "Pair", value.name = "Spearman_p_adj")
+  heat_melt <- merge(heat_melt, fdr_melt, by = c("Region", "Pair"), sort = FALSE) %>%
+    mutate(stars = sapply(Spearman_p_adj, p_to_star), rho = round(Spearman_rho, 2))
+
+  p <- ggplot(heat_melt, aes(Pair, Region, fill = Spearman_rho)) +
+    geom_tile(color = "grey80") +
+    geom_text(aes(label = rho), size = 4, color = "black") +
+    geom_text(aes(label = stars), size = 5, color = "black", nudge_y = 0.25) +
+    scale_fill_gradient2(low = "#0ABFC4", high = "#F7776E", mid = "white",
+                         midpoint = 0, limits = c(-1, 1), na.value = "grey90") +
+    labs(x = NULL, y = NULL, fill = "Spearman \u03c1") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid = element_blank())
+  tiff(out_tiff, width = w, height = h, units = "in", res = 300, compression = "lzw")
+  print(p); dev.off()
+  list(plot = p, heat_data = heat_melt)
+}
+
+plot_module_heatmap <- function(summary_modules, anchor, out_tiff, region_levels = NULL, module_levels = NULL) {
+  tab <- summary_modules %>% filter(Anchor == anchor)
+  if (!is.null(region_levels)) tab$Region <- factor(tab$Region, levels = region_levels)
+  if (!is.null(module_levels)) tab$Module <- factor(tab$Module, levels = module_levels)
+  heat_melt <- merge(
+    reshape2::melt(reshape2::dcast(tab, Region ~ Module, value.var = "Spearman_rho"),
+                   id.vars = "Region", variable.name = "Module", value.name = "Spearman_rho"),
+    reshape2::melt(reshape2::dcast(tab, Region ~ Module, value.var = "Spearman_p_adj"),
+                   id.vars = "Region", variable.name = "Module", value.name = "Spearman_p_adj"),
+    by = c("Region", "Module"), sort = FALSE
+  ) %>% mutate(stars = sapply(Spearman_p_adj, p_to_star), rho = round(Spearman_rho, 2))
+
+  p <- ggplot(heat_melt, aes(Module, Region, fill = Spearman_rho)) +
+    geom_tile(color = "grey80") +
+    geom_text(aes(label = rho), size = 4, color = "black") +
+    geom_text(aes(label = stars), size = 5, color = "black", nudge_y = 0.25) +
+    scale_fill_gradient2(low = "#0ABFC4", high = "#F7776E", mid = "white",
+                         midpoint = 0, limits = c(-1, 1), na.value = "grey90") +
+    labs(x = NULL, y = NULL, fill = "Spearman \u03c1") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid = element_blank())
+  tiff(out_tiff, width = 10, height = 4, units = "in", res = 300, compression = "lzw")
+  print(p); dev.off()
+  list(plot = p, heat_data = heat_melt)
+}
+
+plot_pheno_heatmap <- function(summary_phenotypes, anchor, out_tiff, region_levels = NULL, phenotype_levels = NULL) {
+  tab <- summary_phenotypes %>% dplyr::filter(Anchor == anchor)
+  if (!is.null(region_levels))    tab$Region    <- factor(tab$Region,    levels = region_levels)
+  if (!is.null(phenotype_levels)) tab$Phenotype <- factor(tab$Phenotype, levels = phenotype_levels)
+  heat_melt <- merge(
+    reshape2::melt(reshape2::dcast(tab, Region ~ Phenotype, value.var = "Spearman_rho"),
+                   id.vars = "Region", variable.name = "Phenotype", value.name = "Spearman_rho"),
+    reshape2::melt(reshape2::dcast(tab, Region ~ Phenotype, value.var = "Spearman_p_adj"),
+                   id.vars = "Region", variable.name = "Phenotype", value.name = "Spearman_p_adj"),
+    by = c("Region", "Phenotype"), sort = FALSE
+  ) %>% mutate(stars = sapply(Spearman_p_adj, p_to_star), rho = round(Spearman_rho, 2))
+
+  p <- ggplot(heat_melt, aes(Phenotype, Region, fill = Spearman_rho)) +
+    geom_tile(color = "grey80") +
+    geom_text(aes(label = rho), size = 4, color = "black") +
+    geom_text(aes(label = stars), size = 5, color = "black", nudge_y = 0.25) +
+    scale_fill_gradient2(low = "#0ABFC4", high = "#F7776E", mid = "white",
+                         midpoint = 0, limits = c(-1, 1), na.value = "grey90") +
+    labs(x = NULL, y = NULL, fill = "Spearman \u03c1") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid = element_blank())
+  tiff(out_tiff, width = 5, height = 3, units = "in", res = 300, compression = "lzw")
+  print(p); dev.off()
+  list(plot = p, heat_data = heat_melt)
+}
+
+# ---------- Build pair labels & generate heatmaps ----------
+pair_labels <- function(pl) sapply(pl, function(x) paste(x[1], x[2], sep = " vs "))
+summary_pairs <- summary_pairs %>%
+  mutate(Pair   = paste(Gene1, Gene2, sep = " vs "),
+         Region = factor(Region, levels = region_order),
+         Pair   = factor(Pair, levels = pair_order))
+
+res_SPP1_pairs_list1 <- plot_corr_heatmap(summary_pairs, pair_labels(pairs_SPP1_list1),
+                                           "20260622Correlation_Heatmap_SPP1_pairs_GENES1.tiff")
+res_SPP1_pairs_list2 <- plot_corr_heatmap(summary_pairs, pair_labels(pairs_SPP1_list2),
+                                           "20260622Correlation_Heatmap_SPP1_pairs_GENES2.tiff")
+res_CD44_pairs_list1 <- plot_corr_heatmap(summary_pairs, pair_labels(pairs_CD44_list1),
+                                           "20260622Correlation_Heatmap_CD44_pairs_GENES1.tiff")
+res_CD44_pairs_list2 <- plot_corr_heatmap(summary_pairs, pair_labels(pairs_CD44_list2),
+                                           "20260622Correlation_Heatmap_CD44_pairs_GENES2.tiff")
+
+res_SPP1_modules <- plot_module_heatmap(summary_modules, "SPP1",
+                                         "20260622Correlation_Heatmap_SPP1_Modules.tiff",
+                                         region_order, names(gene_sets))
+res_CD44_modules <- plot_module_heatmap(summary_modules, "CD44",
+                                         "20260622Correlation_Heatmap_CD44_Modules.tiff",
+                                         region_order, names(gene_sets))
+
+res_SPP1_phenotypes <- plot_pheno_heatmap(summary_phenotypes, "SPP1",
+                                           "20260622Correlation_Heatmap_SPP1_Phenotypes.tiff",
+                                           region_order, c("Age.at.Symptom.Onset", "Disease.Duration.in.Months"))
+res_CD44_phenotypes <- plot_pheno_heatmap(summary_phenotypes, "CD44",
+                                           "20260622Correlation_Heatmap_CD44_Phenotypes.tiff",
+                                           region_order, c("Age.at.Symptom.Onset", "Disease.Duration.in.Months"))
+
+res_SPP1_pairs_list1; res_SPP1_pairs_list2
+res_CD44_pairs_list1; res_CD44_pairs_list2
+res_SPP1_modules;     res_CD44_modules
+res_SPP1_phenotypes;  res_CD44_phenotypes
+
+save(vst_list, pheno_list, ens_map, region_order, pair_order, gene_pairs,
+     results_pairs_by_region, results_modules_by_region, results_phenotypes_by_region,
+     summary_pairs, summary_modules, summary_phenotypes,
+     res_SPP1_pairs_list1, res_SPP1_pairs_list2,
+     res_CD44_pairs_list1, res_CD44_pairs_list2,
+     res_SPP1_modules, res_CD44_modules,
+     res_SPP1_phenotypes, res_CD44_phenotypes,
+     file = "20260622_GenePair_Module_Pheno_Corr_results_Output.RData")
+```
+
+---
+
+# 1.6 Survival analysis: KM plots, univariate and multivariate Cox regression
+
+Survival outcome: `Disease.Duration.in.Months` (time from symptom onset to death; all events observed, postmortem tissue).  
+Multivariate Cox covariates: `Sex` + `Age.at.Symptom.Onset` + `OnsetSite` (Bulbar vs Limb; Limb as reference). Technical covariates (RIN, PMI) are not adjusted for in the Cox models, and the §1.5 correlation matrix is corrected for Sex only. See `20260622_n_samples_survival.csv` for per-region events-per-variable.
+`OnsetSite` is pre-collapsed: "Axial and Bulbar" → "Bulbar", "Axial and Limb" → "Limb"; all other categories excluded.
+
+**Single genes tested** (SPP1, CD44, APOE, TREM2, TYROBP): KM (High/Low at median) + univariate Cox + multivariate Cox (continuous VST).  
+**Module scores tested** (Homeostatic microglia, DAM, Activated astrocyte): KM (High/Low at median) + univariate Cox + multivariate Cox (continuous score).
+**Forest plots**: univariate and multivariate plotted separately per region; multivariate plot includes covariate terms.  
+Analyses run **separately** for Cervical, Thoracic, and Lumbar regions.
+
+```{r, message=FALSE}
+library(survival)
+library(survminer)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(broom)
+
+# Assumes vst_list, pheno_list, ens_map, region_order, gene_sets, compute_module_scores
+# loaded from section 1.5 RData. If running fresh:
+# load("20260622_GenePair_Module_Pheno_Corr_results_Output.RData")
+
+outdir_surv <- "4.20260622Survival_expanded"
+dir.create(outdir_surv, showWarnings = FALSE)
+
+# ---------- Configuration ----------
+surv_genes   <- c("SPP1", "CD44", "APOE", "TREM2", "TYROBP")
+surv_modules <- c("Homeostatic_microglia_score", "Disease_associated_microglia_score",
+                  "Activated_astrocyte_score")
+surv_time    <- "Disease.Duration.in.Months"
+# Multivariate Cox covariates: clinical only (Sex, age at onset, onset site).
+# Technical covariates (RIN, PMI) are NOT adjusted for here — RIN was removed by
+# request and PMI is negligible per the §1.4 variancePartition; the §1.5
+# correlation matrix is likewise corrected for Sex only.
+# NOTE on degrees of freedom: every subject is deceased (status = 1), so
+# events = n per region; with score + 3 covariates the ~10-events-per-variable
+# rule wants n >= 40 (>= 20 acceptable). Check the survival sample-count CSV
+# and drop further covariates for any region that is too small.
+cox_covars   <- c("Sex", "Age.at.Symptom.Onset", "OnsetSite")
+covar_terms  <- c("SexMale", "Age.at.Symptom.Onset", "OnsetSiteBulbar")
+
+# ---------- Helper: dichotomise at median ----------
+dichotomise <- function(x, label) {
+  factor(ifelse(x >= median(x, na.rm = TRUE),
+                paste0(label, "_High"), paste0(label, "_Low")),
+         levels = c(paste0(label, "_Low"), paste0(label, "_High")))
+}
+
+# ---------- Helper: KM plot ----------
+plot_km <- function(surv_df, label, region, outdir, type = "gene") {
+  surv_df$grp <- surv_df[[paste0(label, "_group")]]
+  fit <- survfit(Surv(time, status) ~ grp, data = surv_df)
+
+  display_label <- gsub("_score$", " score", gsub("_", " ", label))
+  p <- ggsurvplot(
+    fit,
+    data         = surv_df,
+    pval         = TRUE,
+    pval.method  = TRUE,
+    conf.int     = TRUE,
+    risk.table   = TRUE,
+    legend.title = display_label,
+    palette      = c("#2E9FDF", "#E7B800"),
+    title        = paste0("KM \u2013 ", display_label, " | ", region),
+    xlab         = "Disease Duration (Months)",
+    ylab         = "Overall Survival Probability",
+    ggtheme      = theme_bw(base_size = 13)
+  )
+
+  prefix <- if (type == "module") "KM_module" else "KM"
+  fname  <- file.path(outdir, paste0(prefix, "_", region, "_",
+                                     gsub("[^A-Za-z0-9]", "_", label), ".tiff"))
+  tiff(fname, width = 8, height = 7, units = "in", res = 300, compression = "lzw")
+  print(p); dev.off()
+  message("  KM saved: ", basename(fname))
+  invisible(p)
+}
+
+# ---------- Helper: univariate Cox (predictor only, no covariates) ----------
+run_cox_univariate <- function(surv_df, expr_col, region, label) {
+  model_vars <- c("time", "status", expr_col)
+  df_clean   <- surv_df[complete.cases(surv_df[, model_vars, drop = FALSE]), ]
+
+  if (nrow(df_clean) < 10) {
+    message("  Univariate Cox skipped for ", label, " in ", region,
+            ": n = ", nrow(df_clean))
+    return(NULL)
+  }
+
+  fml <- as.formula(paste("Surv(time, status) ~", expr_col))
+  tryCatch({
+    broom::tidy(coxph(fml, data = df_clean), exponentiate = TRUE, conf.int = TRUE) %>%
+      mutate(Region = region, Label = label, Model = "univariate")
+  }, error = function(e) {
+    message("  Univariate Cox error for ", label, " in ", region, ": ", e$message)
+    NULL
+  })
+}
+
+# ---------- Helper: multivariate Cox (predictor + covariates) ----------
+run_cox_multivariate <- function(surv_df, expr_col, region, label,
+                                 model_type = "multivariate") {
+  available_covars <- cox_covars[cox_covars %in% colnames(surv_df)]
+  model_vars       <- c("time", "status", expr_col, available_covars)
+  df_clean         <- surv_df[complete.cases(surv_df[, model_vars, drop = FALSE]), ]
+
+  if (nrow(df_clean) < 10) {
+    message("  Multivariate Cox skipped for ", label, " in ", region,
+            ": n = ", nrow(df_clean))
+    return(NULL)
+  }
+
+  fml <- as.formula(paste("Surv(time, status) ~",
+                           paste(c(expr_col, available_covars), collapse = " + ")))
+  tryCatch({
+    broom::tidy(coxph(fml, data = df_clean), exponentiate = TRUE, conf.int = TRUE) %>%
+      mutate(Region = region, Label = label, Model = model_type)
+  }, error = function(e) {
+    message("  Multivariate Cox error for ", label, " in ", region, ": ", e$message)
+    NULL
+  })
+}
+
+# ---------- Helper: clean term labels for plotting ----------
+clean_terms <- function(x) {
+  x %>%
+    gsub("_score_expr$", "_score", .) %>%
+    gsub("_expr$",       " (expr)", .) %>%
+    gsub("_",            " ", .)
+}
+
+# ---------- Helper: significance stars ----------
+sig_stars <- function(p) {
+  case_when(
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.1   ~ "\u2020",
+    TRUE      ~ ""
+  )
+}
+
+# ---------- Helper: forest plot — univariate (predictors only) ----------
+plot_forest_univariate <- function(cox_list_uni, region, outdir) {
+  combined <- bind_rows(cox_list_uni) %>%
+    filter(!term %in% covar_terms) %>%          # predictor rows only
+    mutate(term_clean = clean_terms(term),
+           sig_label  = sig_stars(p.value),
+           stat_label = paste0(
+             sprintf("%.2f (%.2f\u2013%.2f), ", estimate, conf.low, conf.high),
+             ifelse(p.value < 0.001, "p<0.001", sprintf("p=%.3f", p.value)),
+             ifelse(sig_label == "", "", paste0(" ", sig_label))))
+
+  if (nrow(combined) == 0) return(invisible(NULL))
+
+  p <- ggplot(combined,
+              aes(x = estimate, y = reorder(term_clean, estimate),
+                  xmin = conf.low, xmax = conf.high)) +
+    geom_pointrange(size = 0.7, color = "#2E9FDF") +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+    # HR (95% CI), p drawn as a right-hand column in the plot margin
+    geom_text(aes(label = stat_label), x = Inf, hjust = -0.05,
+              size = 3, color = "black") +
+    scale_x_log10() +
+    coord_cartesian(clip = "off") +
+    labs(title   = paste0("Univariate Cox HR \u2013 ", region),
+         x       = "Hazard Ratio (95% CI, log scale)",
+         y       = NULL,
+         caption = "\u2020 p<0.1  * p<0.05  ** p<0.01  *** p<0.001") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none",
+          plot.margin     = margin(5.5, 175, 5.5, 5.5))
+
+  n_terms <- nrow(combined)
+  fname <- file.path(outdir, paste0("Cox_Forest_Univariate_", region, ".tiff"))
+  tiff(fname, width = 10, height = 1 + 0.4 * n_terms,
+       units = "in", res = 300, compression = "lzw")
+  print(p); dev.off()
+  message("  Univariate forest plot saved: ", basename(fname))
+  invisible(p)
+}
+
+# ---------- Helper: forest plot — multivariate (predictors + covariates) ----------
+plot_forest_multivariate <- function(cox_list_multi, region, outdir) {
+  # Predictors: one row per gene/module (keep all)
+  # Covariates: deduplicate — take from the first label's model only
+  all_rows   <- bind_rows(cox_list_multi)
+  pred_rows  <- all_rows %>% filter(!term %in% covar_terms)
+  covar_rows <- all_rows %>%
+    filter(term %in% covar_terms) %>%
+    filter(Label == first(unique(all_rows$Label)))   # one representative set
+
+  # Define desired display order (bottom to top in forest plot)
+  predictor_order <- c(
+    "Activated astrocyte score",
+    "Homeostatic microglia score",
+    "TYROBP (expr)",
+    "TREM2 (expr)",
+    "APOE (expr)",
+    "Disease associated microglia score",
+    "CD44 (expr)",
+    "SPP1 (expr)"
+  )
+  covariate_order <- c(
+    "SexMale",
+    "OnsetSiteBulbar",
+    "Age.at.Symptom.Onset"
+  )
+  term_order <- c(covariate_order, predictor_order)
+
+  combined <- bind_rows(pred_rows, covar_rows) %>%
+    mutate(
+      term_type  = ifelse(term %in% covar_terms, "Covariate", "Predictor"),
+      term_clean = clean_terms(term),
+      sig_label  = sig_stars(p.value),
+      stat_label = paste0(
+        sprintf("%.2f (%.2f\u2013%.2f), ", estimate, conf.low, conf.high),
+        ifelse(p.value < 0.001, "p<0.001", sprintf("p=%.3f", p.value)),
+        ifelse(sig_label == "", "", paste0(" ", sig_label))),
+      term_clean = factor(term_clean, levels = term_order)
+    )
+
+  if (nrow(combined) == 0) return(invisible(NULL))
+
+  p <- ggplot(combined,
+              aes(x = estimate, y = term_clean,
+                  xmin = conf.low, xmax = conf.high,
+                  color = term_type, shape = term_type)) +
+    geom_pointrange(size = 0.7) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+    # HR (95% CI), p drawn as a right-hand column in the plot margin
+    geom_text(aes(label = stat_label), x = Inf, hjust = -0.05,
+              size = 4, color = "black") +
+    scale_x_log10() +
+    coord_cartesian(clip = "off") +
+    scale_color_manual(values = c("Predictor" = "#1F6FAE", "Covariate" = "#B0521B"),
+                       name = NULL) +
+    scale_shape_manual(values = c("Predictor" = 16, "Covariate" = 15),
+                       name = NULL) +
+    labs(title   = paste0("Multivariate Cox HR \u2013 ", region),
+         x       = "Hazard Ratio (95% CI, log scale)",
+         y       = NULL,
+         caption = "\u2020 p<0.1  * p<0.05  ** p<0.01  *** p<0.001") +
+    theme_bw(base_size = 14) +
+    theme(legend.position = "bottom",
+          plot.margin     = margin(5.5, 175, 5.5, 5.5))
+
+  n_terms <- nrow(combined)
+  fname <- file.path(outdir, paste0("Cox_Forest_Multivariate_", region, ".tiff"))
+  tiff(fname, width = 9, height = 1 + 0.4 * n_terms,
+       units = "in", res = 300, compression = "lzw")
+  print(p); dev.off()
+  message("  Multivariate forest plot saved: ", basename(fname))
+  invisible(p)
+}
+
+# ============================================================
+# Main loop
+# ============================================================
+all_cox_results <- list()
+surv_n_list     <- list()   # per-region sample counts for the survival analyses
+
+for (region in region_order) {
+  message("\n===== Region: ", region, " =====")
+
+  mat     <- vst_list[[region]]
+  coldata <- pheno_list[[region]]
+
+  # Base survival data frame
+  base_df <- coldata %>%
+    as.data.frame() %>%
+    rownames_to_column("Sample") %>%
+    select(Sample, all_of(c(surv_time, cox_covars[cox_covars %in% colnames(coldata)]))) %>%
+    mutate(
+      time                 = as.numeric(.data[[surv_time]]),
+      status               = 1L,
+      Sex                  = factor(Sex),
+      Age.at.Symptom.Onset = as.numeric(Age.at.Symptom.Onset),
+      OnsetSite            = factor(OnsetSite, levels = c("Limb", "Bulbar"))
+    ) %>%
+    filter(!is.na(time))
+
+  # Module scores for this region
+  module_scores   <- compute_module_scores(mat, ens_map, gene_sets)
+  common_samples  <- intersect(base_df$Sample, rownames(module_scores))
+  available_mods  <- intersect(surv_modules, colnames(module_scores))
+  base_df         <- base_df[base_df$Sample %in% common_samples, ]
+  module_scores   <- module_scores[common_samples, available_mods, drop = FALSE]
+
+  # ---- Samples included in the survival analyses for this region ------------
+  # status is always 1 (postmortem), so n_events == n_complete_covars. EPV is
+  # computed for the full multivariate model: 1 predictor + the present covariates.
+  covars_present <- cox_covars[cox_covars %in% colnames(base_df)]
+  n_complete     <- sum(complete.cases(base_df[, c("time", covars_present), drop = FALSE]))
+  surv_n_list[[region]] <- data.frame(
+    Region              = region,
+    n_with_survival     = nrow(base_df),
+    n_complete_covars   = n_complete,
+    n_covariates_in_mv  = length(covars_present),
+    events_per_variable = round(n_complete / (length(covars_present) + 1), 1)
+  )
+
+  region_cox_uni   <- list()   # univariate results for forest plot
+  region_cox_multi <- list()   # multivariate results for forest plot
+
+  # ---- A) Single genes ----
+  for (gene in surv_genes) {
+    message("  Gene: ", gene)
+    e_gene <- ens_map[gene]
+
+    if (is.na(e_gene) || !(e_gene %in% rownames(mat))) {
+      message("  Skipped \u2013 Ensembl ID not found in VST matrix.")
+      next
+    }
+
+    expr_vals <- as.numeric(mat[e_gene, base_df$Sample])
+    expr_col  <- paste0(gene, "_expr")
+    grp_col   <- paste0(gene, "_group")
+
+    surv_df             <- base_df
+    surv_df[[expr_col]] <- expr_vals
+    surv_df[[grp_col]]  <- dichotomise(expr_vals, gene)
+
+    # KM
+    plot_km(surv_df, gene, region, outdir_surv, type = "gene")
+
+    # Univariate Cox
+    cox_uni <- run_cox_univariate(surv_df, expr_col, region, gene)
+    all_cox_results[[paste(region, gene, "univariate",   sep = "_")]] <- cox_uni
+    if (!is.null(cox_uni))   region_cox_uni[[gene]]   <- cox_uni
+
+    # Multivariate Cox
+    cox_multi <- run_cox_multivariate(surv_df, expr_col, region, gene)
+    all_cox_results[[paste(region, gene, "multivariate", sep = "_")]] <- cox_multi
+    if (!is.null(cox_multi)) region_cox_multi[[gene]] <- cox_multi
+  }
+
+  # ---- B) Module scores ----
+  for (mod in available_mods) {
+    message("  Module: ", mod)
+
+    score_vals <- as.numeric(module_scores[, mod])
+    if (all(is.na(score_vals))) {
+      message("  Skipped \u2013 all NA scores.")
+      next
+    }
+
+    score_col <- paste0(mod, "_expr")
+    grp_col   <- paste0(mod, "_group")
+
+    surv_df              <- base_df
+    surv_df[[score_col]] <- score_vals
+    surv_df[[grp_col]]   <- dichotomise(score_vals, mod)
+
+    # KM
+    plot_km(surv_df, mod, region, outdir_surv, type = "module")
+
+    # Univariate Cox
+    cox_uni <- run_cox_univariate(surv_df, score_col, region, mod)
+    all_cox_results[[paste(region, mod, "univariate",   sep = "_")]] <- cox_uni
+    if (!is.null(cox_uni))   region_cox_uni[[mod]]   <- cox_uni
+
+    # Multivariate Cox
+    cox_multi <- run_cox_multivariate(surv_df, score_col, region, mod,
+                                      model_type = "multivariate_module")
+    all_cox_results[[paste(region, mod, "multivariate", sep = "_")]] <- cox_multi
+    if (!is.null(cox_multi)) region_cox_multi[[mod]] <- cox_multi
+  }
+
+  # ---- C) Forest plots ----
+  plot_forest_univariate(region_cox_uni,   region, outdir_surv)
+  plot_forest_multivariate(region_cox_multi, region, outdir_surv)
+}
+
+# ---------- Combine and export all Cox results ----------
+cox_summary <- bind_rows(all_cox_results) %>%
+  rename(
+    HR         = estimate,
+    HR_lower95 = conf.low,
+    HR_upper95 = conf.high,
+    Pvalue     = p.value
+  ) %>%
+  select(Region, Label, Model, term, HR, HR_lower95, HR_upper95, statistic, Pvalue)
+
+write.csv(cox_summary,
+          file.path(outdir_surv, "20260622_Cox_expanded_summary.csv"),
+          row.names = FALSE)
+
+# ---------- Samples included in §1.6 survival analyses (per region) ----------
+surv_n_samples <- do.call(rbind, surv_n_list)
+print(surv_n_samples)
+write.csv(surv_n_samples,
+          file.path(outdir_surv, "20260622_n_samples_survival.csv"),
+          row.names = FALSE)
+
+message("\nAll survival analyses complete. Outputs saved in: ", outdir_surv)
+print(cox_summary)
+```
+
